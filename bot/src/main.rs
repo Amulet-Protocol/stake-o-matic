@@ -171,6 +171,7 @@ fn release_version_of(matches: &ArgMatches<'_>, name: &str) -> Option<semver::Ve
 pub enum Cluster {
     Testnet,
     MainnetBeta,
+    Devnet
 }
 
 impl std::fmt::Display for Cluster {
@@ -181,6 +182,7 @@ impl std::fmt::Display for Cluster {
             match self {
                 Self::Testnet => "testnet",
                 Self::MainnetBeta => "mainnet-beta",
+                Self::Devnet => "devnet"
             }
         )
     }
@@ -359,7 +361,7 @@ fn get_config() -> BoxResult<(Config, RpcClient, Option<Box<dyn GenericStakePool
             Arg::with_name("cluster")
                 .long("cluster")
                 .value_name("NAME")
-                .possible_values(&["mainnet-beta", "testnet"])
+                .possible_values(&["mainnet-beta", "testnet", "devnet"])
                 .takes_value(true)
                 .default_value("testnet")
                 .required(true)
@@ -664,6 +666,7 @@ fn get_config() -> BoxResult<(Config, RpcClient, Option<Box<dyn GenericStakePool
     let cluster = match value_t_or_exit!(matches, "cluster", String).as_str() {
         "mainnet-beta" => Cluster::MainnetBeta,
         "testnet" => Cluster::Testnet,
+        "devnet" => Cluster::Devnet,
         _ => unreachable!(),
     };
     let quality_block_producer_percentage =
@@ -696,6 +699,8 @@ fn get_config() -> BoxResult<(Config, RpcClient, Option<Box<dyn GenericStakePool
             .unwrap_or_else(|_| "http://api.mainnet-beta.solana.com".into()),
         Cluster::Testnet => value_t!(matches, "json_rpc_url", String)
             .unwrap_or_else(|_| "http://api.testnet.solana.com".into()),
+        Cluster::Devnet => value_t!(matches, "json_rpc_url", String)
+            .unwrap_or_else(|_| "http://api.devnet.solana.com".into())
     };
     let db_path = value_t_or_exit!(matches, "db_path", PathBuf);
     let markdown_path = if matches.is_present("markdown") {
@@ -1385,8 +1390,7 @@ fn classify(
             let data_center_info = data_centers
                 .info
                 .iter()
-                .find(|x| x.id == current_data_center)
-                .unwrap();
+                .find(|x| x.id == current_data_center);
 
             let previous_classification = previous_epoch_validator_classifications
                 .map(|p| p.get(&identity))
@@ -1592,7 +1596,7 @@ fn classify(
                         score_discounts,
                         commission,
                         active_stake,
-                        data_center_concentration: data_center_info.stake_percent,
+                        data_center_concentration: data_center_info.map(|d| d.stake_percent).unwrap_or(0.0),
                         validators_app_info,
                     }),
                     stake_states: Some(stake_states),
@@ -1669,6 +1673,10 @@ fn main() -> BoxResult<()> {
             mainnet_identity_to_participant,
         ),
         Cluster::Testnet => (
+            validator_list::testnet_validators().into_iter().collect(),
+            testnet_identity_to_participant,
+        ),
+        Cluster::Devnet => (
             validator_list::testnet_validators().into_iter().collect(),
             testnet_identity_to_participant,
         ),
@@ -1826,6 +1834,7 @@ fn generate_markdown(epoch: Epoch, config: &Config) -> BoxResult<()> {
     let cluster_md = match config.cluster {
         Cluster::MainnetBeta => "Mainnet",
         Cluster::Testnet => "Testnet",
+        Cluster::Devnet => "Devnet",
     };
 
     while let Some((epoch, epoch_classification)) =
