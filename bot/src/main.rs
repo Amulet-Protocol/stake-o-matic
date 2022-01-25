@@ -209,6 +209,10 @@ pub struct Config {
     score_min_stake: u64,
     /// score discount per concentration percentage point
     score_concentration_point_discount: u32,
+    /// score discount for active stake
+    score_active_stake_discount: u32,
+    /// score bonus for validator participating in Solana delegation program
+    score_registered_validator_bonus: u32,
     /// min average position considering credits_observed, 50.0 = average
     min_avg_position: f64,
 
@@ -656,6 +660,20 @@ fn get_config() -> BoxResult<(Config, RpcClient, Option<Box<dyn GenericStakePool
                     .help("score to discount for each concentration percentage point")
             )
             .arg(
+                Arg::with_name("active_stake_discount")
+                    .long ("active-stake-discount")
+                    .takes_value(true)
+                    .required(false)
+                    .help("score to discount for high active stake")
+            )
+            .arg(
+                Arg::with_name("registered_validator_bonus")
+                    .long ("registered-validator-bonus")
+                    .takes_value(true)
+                    .required(false)
+                    .help("bonus to validator who registered as solana delegation program")
+            )
+            .arg(
                 Arg::with_name("min_avg_position")
                     .long ("min-avg-position")
                     .takes_value(true)
@@ -735,6 +753,8 @@ fn get_config() -> BoxResult<(Config, RpcClient, Option<Box<dyn GenericStakePool
         score_max_commission,
         score_min_stake,
         score_concentration_point_discount,
+        score_active_stake_discount,
+        score_registered_validator_bonus,
         min_avg_position,
     ) = match matches.subcommand() {
         ("score-all", Some(matches)) => (
@@ -742,9 +762,11 @@ fn get_config() -> BoxResult<(Config, RpcClient, Option<Box<dyn GenericStakePool
             value_t!(matches, "score_max_commission", u8).unwrap_or(10),
             value_t!(matches, "score_min_stake", u64).unwrap_or(sol_to_lamports(100.0)),
             value_t!(matches, "concentration_point_discount", u32).unwrap_or(2000),
+            value_t!(matches, "active_stake_discount", u32).unwrap_or(2000),
+            value_t!(matches, "registered_validator_bonus", u32).unwrap_or(2000),
             value_t!(matches, "min_avg_position", f64).unwrap_or(50.0),
         ),
-        _ => (false, 0, 0, 0, 0.0),
+        _ => (false, 0, 0, 0, 0, 0, 0.0),
     };
 
     let pg_host = std::env::var("POSTGRES_HOST").expect("missing environment variable POSTGRES_HOST");
@@ -773,6 +795,8 @@ fn get_config() -> BoxResult<(Config, RpcClient, Option<Box<dyn GenericStakePool
         score_max_commission,
         score_min_stake,
         score_concentration_point_discount,
+        score_active_stake_discount,
+        score_registered_validator_bonus,
         min_avg_position,
         quality_block_producer_percentage,
         max_poor_block_producer_percentage,
@@ -1484,6 +1508,10 @@ fn classify(
             score_discounts.can_halt_the_network_group =
                 active_stake >= last_under_nakamoto_active_stake;
 
+            score_discounts.is_registered_delegation_group = participant.is_some();
+
+
+
             let (stake_state, reason) = if let Some(reason) =
                 infrastructure_concentration_destake_reason
             {
@@ -1616,6 +1644,7 @@ fn classify(
                         active_stake,
                         data_center_concentration: data_center_info.map(|d| d.stake_percent).unwrap_or(0.0),
                         validators_app_info,
+                        total_active_stake
                     }),
                     stake_states: Some(stake_states),
                     stake_action: None,
@@ -1729,34 +1758,26 @@ fn main() -> BoxResult<()> {
 
     let result = config.db_client.query(&prepare_stmt, &[&(epoch as i64)])
         .expect("failed to query item");
+    if result.len() > 0 {
+        info!("Classification for epoch {} already exists", epoch);
+        return Ok(());
+    }
 
     let (mut epoch_classification, first_time, post_notifications) =
-        if result.len() > 0 {
-            info!("Classification for epoch {} already exists", epoch);
-            (
-                EpochClassification::load(epoch, &config.cluster_db_path())?.into_current(),
-                false,
-                config.require_classification,
-            )
-        } else {
-            if config.require_classification {
-                return Err(format!("Classification for epoch {} does not exist", epoch).into());
-            }
-            (
-                classify(
-                    &rpc_client,
-                    &config,
-                    epoch,
-                    &validator_list,
-                    &identity_to_participant,
-                    previous_epoch_classification
-                        .validator_classifications
-                        .as_ref(),
-                )?,
-                true,
-                true,
-            )
-        };
+        (
+            classify(
+                &rpc_client,
+                &config,
+                epoch,
+                &validator_list,
+                &identity_to_participant,
+                previous_epoch_classification
+                    .validator_classifications
+                    .as_ref(),
+            )?,
+            true,
+            true,
+        );
 
     let mut notifications = epoch_classification.notes.clone();
 

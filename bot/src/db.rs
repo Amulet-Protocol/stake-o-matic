@@ -18,6 +18,7 @@ use {
 #[derive(Default, Clone, Deserialize, Serialize)]
 pub struct ScoreDiscounts {
     pub can_halt_the_network_group: bool,
+    pub is_registered_delegation_group: bool
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -40,6 +41,7 @@ pub struct ScoreData {
     pub active_stake: u64,
     pub data_center_concentration: f64,
     pub validators_app_info: ByIdentityInfo,
+    pub total_active_stake: u64
 }
 
 #[derive(Default, Clone, Deserialize, Serialize)]
@@ -102,11 +104,18 @@ impl ScoreData {
             // So to treat both the same we apply commission to self.epoch_credits
             let discount_because_commission = self.commission as u64 * self.epoch_credits / 100;
 
-            // give extra score to above average validators in order to increase APY for our users
-            let points_added_above_average: u64 = if self.average_position > 50.0 {
-                let above = self.average_position - 50.0;
-                let multiplier = if above * above > 25.0 { 25.0 } else {above * above};
-                (multiplier * self.epoch_credits as f64) as u64
+            // score discount according to the active stake
+            // if the stake percentage is too high, > 20, compared to the total active stake, add discount
+            let stake_percentage: f64 = self.active_stake as f64 / self.total_active_stake as f64;
+            let discount_because_active_stake = (if stake_percentage > 0.2 {
+                stake_percentage * config.score_active_stake_discount as f64
+            } else {
+                0.0
+            }) as u64;
+
+            // give bonus when the validator is part of the Solana delegation program
+            let bonus_because_validator_program = if self.score_discounts.is_registered_delegation_group {
+                config.score_registered_validator_bonus
             } else {
                 0
             };
@@ -115,7 +124,8 @@ impl ScoreData {
             self.epoch_credits
                 .saturating_sub(discount_because_commission)
                 .saturating_sub(discount_because_data_center_concentration)
-                .saturating_add(points_added_above_average)
+                .saturating_sub(discount_because_active_stake)
+                .saturating_add(bonus_because_validator_program as u64)
         }
     }
 }
