@@ -36,6 +36,9 @@ solana-vote-program = "1.7.4"
 spl-stake-pool = "0.4"
 spl-token = "3.1"
 thiserror = "1.0.25"
+postgres-openssl = "0.5.0"
+openssl = "0.10.38"
+postgres = "0.19.2"
 
 [dev-dependencies]
 indicatif = "0.15.0"

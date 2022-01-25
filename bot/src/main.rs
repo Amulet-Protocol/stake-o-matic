@@ -1,3 +1,6 @@
+use openssl::ssl::{SslConnector, SslMethod};
+use postgres_openssl::MakeTlsConnector;
+use postgres::types::Type;
 use {
     crate::{db::*, generic_stake_pool::*, rpc_client_utils::*},
     clap::{
@@ -188,8 +191,8 @@ impl std::fmt::Display for Cluster {
     }
 }
 
-#[derive(Debug)]
 pub struct Config {
+    db_client: postgres::Client,
     json_rpc_url: String,
     cluster: Cluster,
     db_path: PathBuf,
@@ -744,7 +747,22 @@ fn get_config() -> BoxResult<(Config, RpcClient, Option<Box<dyn GenericStakePool
         _ => (false, 0, 0, 0, 0.0),
     };
 
+    let pg_host = std::env::var("POSTGRES_HOST").expect("missing environment variable POSTGRES_HOST");
+    let pg_user = std::env::var("POSTGRES_USER").expect("missing environment variable POSTGRES_USER");
+    let pg_password = std::env::var("POSTGRES_PASSWORD").expect("missing environment variable POSTGRES_PASSWORD");
+    let pg_dbname = std::env::var("POSTGRES_DBNAME").unwrap_or("postgres".to_string());
+
+    let builder = SslConnector::builder(SslMethod::tls()).unwrap();
+    let tls_connector = MakeTlsConnector::new(builder.build());
+
+    let url = format!(
+        "host={} port=5432 user={} password={} dbname={} sslmode=require",
+        pg_host, pg_user, pg_password, pg_dbname
+    );
+    let db_client = postgres::Client::connect(&url, tls_connector).expect("failed to connect to postgres");
+
     let config = Config {
+        db_client,
         json_rpc_url,
         cluster,
         db_path,
@@ -776,7 +794,7 @@ fn get_config() -> BoxResult<(Config, RpcClient, Option<Box<dyn GenericStakePool
 
     info!("RPC URL: {}", config.json_rpc_url);
     let rpc_client =
-        RpcClient::new_with_timeout(config.json_rpc_url.clone(), Duration::from_secs(180));
+        RpcClient::new_with_timeout(config.json_rpc_url.clone(), Duration::from_secs(300));
 
     // Sanity check that the RPC endpoint is healthy before performing too much work
     {
@@ -1634,13 +1652,16 @@ fn classify(
 fn main() -> BoxResult<()> {
     solana_logger::setup_with_default("solana=info");
 
-    let (config, rpc_client, optional_stake_pool) = get_config()?;
+    let (mut config, rpc_client, optional_stake_pool) = get_config()?;
 
     info!("Loading participants...");
-    let participants = get_participants_with_state(
+    let participants = match get_participants_with_state(
         &RpcClient::new("https://api.mainnet-beta.solana.com".to_string()),
         Some(ParticipantState::Approved),
-    )?;
+    ){
+        Ok(participants) => participants,
+        Err(e) => HashMap::new()
+    };
 
     let (mainnet_identity_to_participant, testnet_identity_to_participant): (
         IdentityToParticipant,
@@ -1702,8 +1723,15 @@ fn main() -> BoxResult<()> {
             .unwrap_or_default()
             .into_current();
 
+    let query: &str = "SELECT distinct(epoch) from validators where epoch=$1";
+    let prepare_stmt = config.db_client.prepare_typed(query, &[Type::INT8])
+        .expect("failed to create prepared statement");
+
+    let result = config.db_client.query(&prepare_stmt, &[&(epoch as i64)])
+        .expect("failed to query item");
+
     let (mut epoch_classification, first_time, post_notifications) =
-        if EpochClassification::exists(epoch, &config.cluster_db_path()) {
+        if result.len() > 0 {
             info!("Classification for epoch {} already exists", epoch);
             (
                 EpochClassification::load(epoch, &config.cluster_db_path())?.into_current(),
@@ -1814,12 +1842,12 @@ fn main() -> BoxResult<()> {
     }
 
     //conditional to: matches.is_present("markdown")
-    generate_markdown(epoch, &config)?;
+    generate_markdown(epoch, &mut config)?;
 
     Ok(())
 }
 
-fn generate_markdown(epoch: Epoch, config: &Config) -> BoxResult<()> {
+fn generate_markdown(epoch: Epoch, config: &mut Config) -> BoxResult<()> {
     let markdown_path = match config.markdown_path.as_ref() {
         Some(d) => d,
         None => return Ok(()), // exit if !matches.is_present("markdown")
@@ -1831,69 +1859,7 @@ fn generate_markdown(epoch: Epoch, config: &Config) -> BoxResult<()> {
         EpochClassification::load(epoch, &config.cluster_db_path())?.into_current(),
     )];
 
-    let cluster_md = match config.cluster {
-        Cluster::MainnetBeta => "Mainnet",
-        Cluster::Testnet => "Testnet",
-        Cluster::Devnet => "Devnet",
-    };
-
-    while let Some((epoch, epoch_classification)) =
-        EpochClassification::load_previous(list.last().unwrap().0, &config.cluster_db_path())?
-    {
-        list.push((epoch, epoch_classification.into_current()));
-    }
-
-    let validator_summary_csv = {
-        let mut validator_summary_csv = vec![];
-
-        let mut csv = vec!["Identity".to_string()];
-        let mut validator_stakes: HashMap<Pubkey, HashMap<Epoch, ValidatorStakeState>> =
-            HashMap::default();
-        let mut validator_epochs = vec![];
-        for (epoch, epoch_classification) in list.iter() {
-            csv.push(format!("Epoch {}", epoch));
-            validator_epochs.push(epoch);
-            if let Some(ref validator_classifications) =
-                epoch_classification.validator_classifications
-            {
-                for (identity, classification) in validator_classifications {
-                    validator_stakes
-                        .entry(*identity)
-                        .or_default()
-                        .insert(*epoch, classification.stake_state);
-                }
-            }
-        }
-        validator_summary_csv.push(csv.join(","));
-
-        let mut validator_stakes = validator_stakes.into_iter().collect::<Vec<_>>();
-        validator_stakes.sort_by(|a, b| a.0.cmp(&b.0));
-        for (identity, epoch_stakes) in validator_stakes {
-            let mut csv = vec![identity.to_string()];
-            for epoch in &validator_epochs {
-                if let Some(stake_state) = epoch_stakes.get(epoch) {
-                    csv.push(format!("{:?}", stake_state));
-                } else {
-                    csv.push("-".to_string());
-                }
-            }
-            validator_summary_csv.push(csv.join(","));
-        }
-        validator_summary_csv.join("\n")
-    };
-    let filename = config.cluster_db_path().join("validator-summary.csv");
-    info!("Writing {}", filename.display());
-    let mut file = File::create(filename)?;
-    file.write_all(&validator_summary_csv.into_bytes())?;
-
-    let mut validators_markdown: HashMap<_, Vec<_>> = HashMap::default();
-    let mut cluster_markdown = vec![];
     for (epoch, epoch_classification) in list.iter() {
-        cluster_markdown.push(format!("### Epoch {}", epoch));
-        for note in &epoch_classification.notes {
-            cluster_markdown.push(format!("* {}", note));
-        }
-
         if let Some(ref validator_classifications) = epoch_classification.validator_classifications
         {
             let mut validator_detail_csv = vec![];
@@ -1909,31 +1875,9 @@ fn generate_markdown(epoch: Epoch, config: &Config) -> BoxResult<()> {
                     .cmp(&a.1.score_data.as_ref().unwrap().epoch_credits)
             });
             for (identity, classification) in validator_classifications {
-                let validator_markdown = validators_markdown.entry(identity).or_default();
-
-                validator_markdown.push(format!(
-                    "### [[{1} Epoch {0}|{1}#Epoch-{0}]]",
-                    epoch, cluster_md
-                ));
-                let stake_state_streak = classification.stake_state_streak();
-                validator_markdown.push(format!(
-                    "* Stake level: **{:?}**{}",
-                    classification.stake_state,
-                    if stake_state_streak > 1 {
-                        format!(" (for {} epochs)", stake_state_streak)
-                    } else {
-                        "".to_string()
-                    }
-                ));
-                validator_markdown.push(format!(
-                    "* Stake reason: {}",
-                    classification.stake_state_reason
-                ));
-
                 //epoch,keybase_id,name,identity,vote_address,score,average_position,commission,active_stake,epoch_credits,data_center_concentration,can_halt_the_network_group,stake_state,stake_state_reason,www_url
                 if let Some(score_data) = &classification.score_data {
                     let score = score_data.score(config);
-
                     let csv_line = format!(
                         r#"{},"{}","{}","{}","{}",{},{},{},{},{},{:.4},{},"{:?}","{}","{}""#,
                         epoch,
@@ -1954,65 +1898,14 @@ fn generate_markdown(epoch: Epoch, config: &Config) -> BoxResult<()> {
                     );
                     validator_detail_csv.push(csv_line);
                 }
-
-                if let Some(ref stake_action) = classification.stake_action {
-                    validator_markdown.push(format!("* Staking activity: {}", stake_action));
-                }
-
-                validator_markdown.push(format!(
-                    "* Vote account address: {}",
-                    classification.vote_address
-                ));
-                if let (Some(current_data_center), Some(data_center_residency)) = (
-                    classification.current_data_center.as_ref(),
-                    classification.data_center_residency.as_ref(),
-                ) {
-                    validator_markdown.push(format!("* Data Center: {}", current_data_center));
-
-                    if !data_center_residency.is_empty() {
-                        validator_markdown.push(format!(
-                            "* Resident Data Center(s): {}",
-                            data_center_residency
-                                .iter()
-                                .map(|(data_center, seniority)| format!(
-                                    "{} (seniority: {})",
-                                    data_center, seniority
-                                ))
-                                .collect::<Vec<String>>()
-                                .join(",")
-                        ));
-                    }
-                }
-
-                for note in &classification.notes {
-                    validator_markdown.push(format!("* {}", note));
-                }
             }
-            // save {cluster}-validator-detail.csv (repeating the cluster in the name is intentional)
-            let filename = config
-                .cluster_db_path()
-                .join(format!("{}-validator-detail.csv", config.cluster));
-            info!("Writing {}", filename.display());
-            let mut file = File::create(filename)?;
-            file.write_all(&validator_detail_csv.join("\n").into_bytes())?;
+
+            let query = "COPY validators FROM STDIN DELIMITER ',' CSV HEADER";
+            let mut writer = config.db_client.copy_in(query)?;
+            writer.write_all(&validator_detail_csv.join("\n").into_bytes())?;
+            writer.finish()?;
         }
     }
-
-    for (identity, validator_markdown) in validators_markdown {
-        let markdown = validator_markdown.join("\n");
-        let filename = markdown_path.join(format!("Validator-{}.md", identity));
-        if !config.score_all {
-            info!("Writing {}", filename.display())
-        }
-        let mut file = File::create(filename)?;
-        file.write_all(&markdown.into_bytes())?;
-    }
-
-    let markdown = cluster_markdown.join("\n");
-    let filename = markdown_path.join(format!("{}.md", cluster_md));
-    info!("Writing {}", filename.display());
-    let mut file = File::create(filename)?;
-    file.write_all(&markdown.into_bytes())?;
 
     Ok(())
 }
