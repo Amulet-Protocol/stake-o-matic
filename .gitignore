@@ -4,3 +4,4 @@
 /db
 test-ledger/
 .vscode
+Cargo.lock

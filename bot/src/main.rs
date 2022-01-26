@@ -1393,9 +1393,10 @@ fn classify(
         ));
     }
 
-    let validator_classifications = if too_many_poor_voters
+    let validator_classifications = if
+        config.cluster != Cluster::Devnet && (too_many_poor_voters
         || too_many_old_validators
-        || too_many_poor_block_producers
+        || too_many_poor_block_producers)
     {
         notes.push("Stake adjustments skipped this epoch".to_string());
         None
