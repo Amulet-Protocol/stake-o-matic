@@ -344,7 +344,9 @@ fn app_version() -> String {
     })
 }
 
-fn get_config() -> BoxResult<(Config, RpcClient, Option<Box<dyn GenericStakePool>>)> {
+fn get_config<I, T>(args: I) -> BoxResult<(Config, RpcClient, Option<Box<dyn GenericStakePool>>)> where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone {
     let default_confirmed_block_cache_path = default_confirmed_block_cache_path()
         .to_str()
         .unwrap()
@@ -681,7 +683,7 @@ fn get_config() -> BoxResult<(Config, RpcClient, Option<Box<dyn GenericStakePool
                     .help("min avg position required considering epoch_credits")
             )
         )
-        .get_matches();
+        .get_matches_from(args);
 
     let dry_run = !matches.is_present("confirm");
     let cluster = match value_t_or_exit!(matches, "cluster", String).as_str() {
@@ -1679,11 +1681,8 @@ fn classify(
     })
 }
 
-fn main() -> BoxResult<()> {
-    solana_logger::setup_with_default("solana=info");
-
-    let (mut config, rpc_client, optional_stake_pool) = get_config()?;
-
+fn fetch_store_validators(mut config: Config, rpc_client: RpcClient,
+                          optional_stake_pool: Option<Box<dyn GenericStakePool>>) -> BoxResult<()> {
     info!("Loading participants...");
     let participants = match get_participants_with_state(
         &RpcClient::new("https://api.mainnet-beta.solana.com".to_string()),
@@ -1700,13 +1699,13 @@ fn main() -> BoxResult<()> {
         .iter()
         .map(
             |(
-                participant,
-                Participant {
-                    mainnet_identity,
-                    testnet_identity,
-                    ..
-                },
-            )| {
+                 participant,
+                 Participant {
+                     mainnet_identity,
+                     testnet_identity,
+                     ..
+                 },
+             )| {
                 (
                     (*mainnet_identity, *participant),
                     (*testnet_identity, *participant),
@@ -1867,6 +1866,24 @@ fn main() -> BoxResult<()> {
     generate_markdown(epoch, &mut config)?;
 
     Ok(())
+}
+
+fn main() -> BoxResult<()> {
+    solana_logger::setup_with_default("solana=info");
+
+    let (config, rpc_client, optional_stake_pool) =
+        get_config(std::env::args_os())?;
+
+    fetch_store_validators(config, rpc_client, optional_stake_pool)
+}
+
+pub fn run(args: &Vec<String>) -> BoxResult<()> {
+    solana_logger::setup_with_default("solana=info");
+
+    let (config, rpc_client, optional_stake_pool) =
+        get_config(args)?;
+
+    fetch_store_validators(config, rpc_client, optional_stake_pool)
 }
 
 fn generate_markdown(epoch: Epoch, config: &mut Config) -> BoxResult<()> {
