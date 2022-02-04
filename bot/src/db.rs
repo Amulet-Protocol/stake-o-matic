@@ -106,10 +106,15 @@ impl ScoreData {
             let discount_because_commission = self.commission as f64;
 
             // score discount according to the active stake
-            // if the stake percentage is too high, more than 3 std dev of mean,
+            // if the stake percentage is too high, more than 3 std dev,
             // compared to the total active stake, add discount
-            let discount_because_active_stake = (self.active_stake * 100) as f64 /
-                (self.mean_active_stake + 3 * self.std_active_stake) as f64;
+            let active_stake_position = (self.active_stake * 50) as f64 /
+                (3 * self.std_active_stake) as f64;
+            let discount_because_active_stake = if active_stake_position - 49.0 < 0.0 {
+                0.0
+            } else {
+                active_stake_position - 49 as f64
+            };
 
             // give bonus when the validator is part of the Solana delegation program
             let bonus_because_validator_program = (if self.score_discounts.is_registered_delegation_group {
