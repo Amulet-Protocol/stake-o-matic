@@ -178,10 +178,22 @@ pub struct VoteAccountInfo {
     pub epoch_credits: u64,
 }
 
+pub fn mean_std(data: &[u64]) -> (u64, u64) {
+    let sum = data.iter().sum::<u64>() as f64;
+    let count = data.len();
+    let mean = sum / count as f64;
+    let variance = data.iter().map(|value| {
+        let diff = mean - (*value as f64);
+        diff * diff
+    }).sum::<f64>() / count as f64;
+
+    (mean as u64, variance.sqrt() as u64)
+}
+
 pub fn get_vote_account_info(
     rpc_client: &RpcClient,
     epoch: Epoch,
-) -> Result<(Vec<VoteAccountInfo>, u64), Box<dyn error::Error>> {
+) -> Result<(Vec<VoteAccountInfo>, u64, u64, u64), Box<dyn error::Error>> {
     let RpcVoteAccountStatus {
         current,
         delinquent,
@@ -190,7 +202,9 @@ pub fn get_vote_account_info(
     let mut latest_vote_account_info = HashMap::<String, _>::new();
 
     let mut total_active_stake = 0;
+    let mut active_stakes: Vec<u64> = Vec::new();
     for vote_account_info in current.into_iter().chain(delinquent.into_iter()) {
+        active_stakes.push(vote_account_info.activated_stake);
         total_active_stake += vote_account_info.activated_stake;
 
         let entry = latest_vote_account_info
@@ -203,6 +217,8 @@ pub fn get_vote_account_info(
             *entry = vote_account_info.clone();
         }
     }
+
+    let (mean_active_stake, std_active_stake) = mean_std(&active_stakes);
 
     Ok((
         latest_vote_account_info
@@ -237,6 +253,8 @@ pub fn get_vote_account_info(
             )
             .collect(),
         total_active_stake,
+        mean_active_stake,
+        std_active_stake
     ))
 }
 

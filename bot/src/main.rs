@@ -209,8 +209,6 @@ pub struct Config {
     score_min_stake: u64,
     /// score discount per concentration percentage point
     score_concentration_point_discount: u32,
-    /// score discount for active stake
-    score_active_stake_discount: u32,
     /// score bonus for validator participating in Solana delegation program
     score_registered_validator_bonus: u32,
     /// min average position considering credits_observed, 50.0 = average
@@ -287,6 +285,7 @@ impl Config {
     #[cfg(test)]
     pub fn default_for_test() -> Self {
         Self {
+            db_client: postgres::Client("localhost"),
             json_rpc_url: "https://api.mainnet-beta.solana.com".to_string(),
             cluster: Cluster::MainnetBeta,
             db_path: PathBuf::default(),
@@ -297,6 +296,7 @@ impl Config {
             score_max_commission: 8,
             score_min_stake: sol_to_lamports(100.0),
             score_concentration_point_discount: 1_500,
+            score_registered_validator_bonus: 0,
             min_avg_position: 40.0,
             quality_block_producer_percentage: 15,
             max_poor_block_producer_percentage: 20,
@@ -662,13 +662,6 @@ fn get_config<I, T>(args: I) -> BoxResult<(Config, RpcClient, Option<Box<dyn Gen
                     .help("score to discount for each concentration percentage point")
             )
             .arg(
-                Arg::with_name("active_stake_discount")
-                    .long ("active-stake-discount")
-                    .takes_value(true)
-                    .required(false)
-                    .help("score to discount for high active stake")
-            )
-            .arg(
                 Arg::with_name("registered_validator_bonus")
                     .long ("registered-validator-bonus")
                     .takes_value(true)
@@ -755,7 +748,6 @@ fn get_config<I, T>(args: I) -> BoxResult<(Config, RpcClient, Option<Box<dyn Gen
         score_max_commission,
         score_min_stake,
         score_concentration_point_discount,
-        score_active_stake_discount,
         score_registered_validator_bonus,
         min_avg_position,
     ) = match matches.subcommand() {
@@ -763,12 +755,11 @@ fn get_config<I, T>(args: I) -> BoxResult<(Config, RpcClient, Option<Box<dyn Gen
             true,
             value_t!(matches, "score_max_commission", u8).unwrap_or(10),
             value_t!(matches, "score_min_stake", u64).unwrap_or(sol_to_lamports(100.0)),
-            value_t!(matches, "concentration_point_discount", u32).unwrap_or(2000),
-            value_t!(matches, "active_stake_discount", u32).unwrap_or(2000),
-            value_t!(matches, "registered_validator_bonus", u32).unwrap_or(2000),
+            value_t!(matches, "concentration_point_discount", u32).unwrap_or(3),
+            value_t!(matches, "registered_validator_bonus", u32).unwrap_or(10),
             value_t!(matches, "min_avg_position", f64).unwrap_or(50.0),
         ),
-        _ => (false, 0, 0, 0, 0, 0, 0.0),
+        _ => (false, 0, 0, 0, 0, 0.0),
     };
 
     let pg_host = std::env::var("POSTGRES_HOST").expect("missing environment variable POSTGRES_HOST");
@@ -797,7 +788,6 @@ fn get_config<I, T>(args: I) -> BoxResult<(Config, RpcClient, Option<Box<dyn Gen
         score_max_commission,
         score_min_stake,
         score_concentration_point_discount,
-        score_active_stake_discount,
         score_registered_validator_bonus,
         min_avg_position,
         quality_block_producer_percentage,
@@ -1235,7 +1225,8 @@ fn classify(
         .flat_map(|(v, sp)| v.into_iter().map(move |v| (v, sp)))
         .collect::<HashMap<_, _>>();
 
-    let (mut vote_account_info, total_active_stake) =
+    let (mut vote_account_info, total_active_stake,
+        mean_active_stake, std_active_stake) =
         get_vote_account_info(rpc_client, last_epoch)?;
 
     // compute cumulative_stake_limit => active_stake of the last validator inside the can-halt-the-network group
@@ -1647,7 +1638,9 @@ fn classify(
                         active_stake,
                         data_center_concentration: data_center_info.map(|d| d.stake_percent).unwrap_or(0.0),
                         validators_app_info,
-                        total_active_stake
+                        total_active_stake,
+                        mean_active_stake,
+                        std_active_stake
                     }),
                     stake_states: Some(stake_states),
                     stake_action: None,
@@ -1776,7 +1769,7 @@ fn fetch_store_validators(mut config: Config, rpc_client: RpcClient,
                     .as_ref(),
             )?,
             true,
-            true,
+            false,
         );
 
     let mut notifications = epoch_classification.notes.clone();
@@ -1902,7 +1895,7 @@ fn generate_markdown(epoch: Epoch, config: &mut Config) -> BoxResult<()> {
         if let Some(ref validator_classifications) = epoch_classification.validator_classifications
         {
             let mut validator_detail_csv = vec![];
-            validator_detail_csv.push("epoch,keybase_id,name,identity,vote_address,score,average_position,commission,active_stake,epoch_credits,data_center_concentration,can_halt_the_network_group,stake_state,stake_state_reason,www_url".into());
+            validator_detail_csv.push("epoch,keybase_id,name,identity,vote_address,score,average_position,commission,active_stake,epoch_credits,data_center_concentration,can_halt_the_network_group,stake_state,stake_state_reason,www_url,is_delegation_program".into());
             let mut validator_classifications =
                 validator_classifications.iter().collect::<Vec<_>>();
             // sort by credits, desc
@@ -1918,7 +1911,7 @@ fn generate_markdown(epoch: Epoch, config: &mut Config) -> BoxResult<()> {
                 if let Some(score_data) = &classification.score_data {
                     let score = score_data.score(config);
                     let csv_line = format!(
-                        r#"{},"{}","{}","{}","{}",{},{},{},{},{},{:.4},{},"{:?}","{}","{}""#,
+                        r#"{},"{}","{}","{}","{}",{},{},{},{},{},{:.4},{},"{:?}","{}","{}", {}"#,
                         epoch,
                         score_data.validators_app_info.keybase_id,
                         score_data.validators_app_info.name,
@@ -1934,6 +1927,7 @@ fn generate_markdown(epoch: Epoch, config: &mut Config) -> BoxResult<()> {
                         classification.stake_state,
                         classification.stake_state_reason,
                         score_data.validators_app_info.www_url,
+                        classification.participant.is_some()
                     );
                     validator_detail_csv.push(csv_line);
                 }

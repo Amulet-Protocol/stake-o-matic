@@ -13,5 +13,6 @@ CREATE TABLE validators(
    can_halt_the_network_group BOOL,
    stake_state TEXT,
    stake_state_reason TEXT,
-   www_url TEXT
+   www_url TEXT,
+   is_delegation_program BOOL
 );

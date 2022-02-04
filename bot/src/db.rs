@@ -41,7 +41,9 @@ pub struct ScoreData {
     pub active_stake: u64,
     pub data_center_concentration: f64,
     pub validators_app_info: ByIdentityInfo,
-    pub total_active_stake: u64
+    pub total_active_stake: u64,
+    pub mean_active_stake: u64,
+    pub std_active_stake: u64
 }
 
 #[derive(Default, Clone, Deserialize, Serialize)]
@@ -91,9 +93,8 @@ impl ScoreData {
         } else {
             // if data_center_concentration = 25%, lose all score,
             // data_center_concentration = 10%, lose 40% (rounded)
-            let discount_because_data_center_concentration = (self.data_center_concentration
-                * config.score_concentration_point_discount as f64)
-                as u64;
+            let discount_because_data_center_concentration = self.data_center_concentration
+                * config.score_concentration_point_discount as f64;
 
             // score discounts according to commission
             // apply commission % as a discount to credits_observed.
@@ -102,30 +103,26 @@ impl ScoreData {
             // from our user's point of view, it's the same as a 150K credits validator with 0% commission,
             // both represent the same APY for the user.
             // So to treat both the same we apply commission to self.epoch_credits
-            let discount_because_commission = self.commission as u64 * self.epoch_credits / 100;
+            let discount_because_commission = self.commission as f64;
 
             // score discount according to the active stake
-            // if the stake percentage is too high, > 20, compared to the total active stake, add discount
-            let stake_percentage: f64 = self.active_stake as f64 / self.total_active_stake as f64;
-            let discount_because_active_stake = (if stake_percentage > 0.2 {
-                stake_percentage * config.score_active_stake_discount as f64
-            } else {
-                0.0
-            }) as u64;
+            // if the stake percentage is too high, more than 3 std dev of mean,
+            // compared to the total active stake, add discount
+            let discount_because_active_stake = (self.active_stake * 100) as f64 /
+                (self.mean_active_stake + 3 * self.std_active_stake) as f64;
 
             // give bonus when the validator is part of the Solana delegation program
-            let bonus_because_validator_program = if self.score_discounts.is_registered_delegation_group {
+            let bonus_because_validator_program = (if self.score_discounts.is_registered_delegation_group {
                 config.score_registered_validator_bonus
             } else {
                 0
-            };
+            }) as f64;
+
+            let total_percentage = (100.0 - discount_because_commission - discount_because_active_stake
+                - discount_because_data_center_concentration + bonus_because_validator_program) / 100.0;
 
             //result
-            self.epoch_credits
-                .saturating_sub(discount_because_commission)
-                .saturating_sub(discount_because_data_center_concentration)
-                .saturating_sub(discount_because_active_stake)
-                .saturating_add(bonus_because_validator_program as u64)
+            (self.epoch_credits as f64 * total_percentage) as u64
         }
     }
 }
