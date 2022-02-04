@@ -109,7 +109,7 @@ impl ScoreData {
             // if the stake percentage is too high, more than 3 std dev,
             // compared to the total active stake, add discount
             let active_stake_position = (self.active_stake * 50) as f64 /
-                (3 * self.std_active_stake) as f64;
+                (config.active_stake_std_multiplier as f64 * self.std_active_stake as f64);
             let discount_because_active_stake = if active_stake_position - 49.0 < 0.0 {
                 0.0
             } else {

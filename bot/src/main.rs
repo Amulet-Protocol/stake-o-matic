@@ -209,6 +209,8 @@ pub struct Config {
     score_min_stake: u64,
     /// score discount per concentration percentage point
     score_concentration_point_discount: u32,
+    /// active stake position threshold, using standard deviation multiplier as the base for middle position
+    active_stake_std_multiplier: f32,
     /// score bonus for validator participating in Solana delegation program
     score_registered_validator_bonus: u32,
     /// min average position considering credits_observed, 50.0 = average
@@ -297,6 +299,7 @@ impl Config {
             score_min_stake: sol_to_lamports(100.0),
             score_concentration_point_discount: 1_500,
             score_registered_validator_bonus: 0,
+            active_stake_std_multiplier: 3,
             min_avg_position: 40.0,
             quality_block_producer_percentage: 15,
             max_poor_block_producer_percentage: 20,
@@ -659,7 +662,14 @@ fn get_config<I, T>(args: I) -> BoxResult<(Config, RpcClient, Option<Box<dyn Gen
                     .long ("concentration-point-discount")
                     .takes_value(true)
                     .required(false)
-                    .help("score to discount for each concentration percentage point")
+                    .help("percentage to discount for each concentration percentage point")
+            )
+            .arg(
+                Arg::with_name("active_stake_std_multiplier")
+                    .long ("active-stake-std-multiplier")
+                    .takes_value(true)
+                    .required(false)
+                    .help("standard deviation multiplier for active stake position")
             )
             .arg(
                 Arg::with_name("registered_validator_bonus")
@@ -749,6 +759,7 @@ fn get_config<I, T>(args: I) -> BoxResult<(Config, RpcClient, Option<Box<dyn Gen
         score_min_stake,
         score_concentration_point_discount,
         score_registered_validator_bonus,
+        active_stake_std_multiplier,
         min_avg_position,
     ) = match matches.subcommand() {
         ("score-all", Some(matches)) => (
@@ -757,9 +768,10 @@ fn get_config<I, T>(args: I) -> BoxResult<(Config, RpcClient, Option<Box<dyn Gen
             value_t!(matches, "score_min_stake", u64).unwrap_or(sol_to_lamports(100.0)),
             value_t!(matches, "concentration_point_discount", u32).unwrap_or(3),
             value_t!(matches, "registered_validator_bonus", u32).unwrap_or(10),
+            value_t!(matches, "active_stake_std_multiplier", f32).unwrap_or(3.0),
             value_t!(matches, "min_avg_position", f64).unwrap_or(50.0),
         ),
-        _ => (false, 0, 0, 0, 0, 0.0),
+        _ => (false, 0, 0, 0, 0, 0.0, 0.0),
     };
 
     let pg_host = std::env::var("POSTGRES_HOST").expect("missing environment variable POSTGRES_HOST");
@@ -789,6 +801,7 @@ fn get_config<I, T>(args: I) -> BoxResult<(Config, RpcClient, Option<Box<dyn Gen
         score_min_stake,
         score_concentration_point_discount,
         score_registered_validator_bonus,
+        active_stake_std_multiplier,
         min_avg_position,
         quality_block_producer_percentage,
         max_poor_block_producer_percentage,
