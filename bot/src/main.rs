@@ -1924,7 +1924,7 @@ fn generate_markdown(epoch: Epoch, config: &mut Config) -> BoxResult<()> {
                 if let Some(score_data) = &classification.score_data {
                     let score = score_data.score(config);
                     let csv_line = format!(
-                        r#"{},"{}","{}","{}","{}",{},{},{},{},{},{:.4},{},"{:?}","{}","{}", {}"#,
+                        r#"{},"{}","{}","{}","{}",{},{},{},{},{},{:.4},{},"{:?}","{}","{}",{}"#,
                         epoch,
                         score_data.validators_app_info.keybase_id,
                         score_data.validators_app_info.name,
