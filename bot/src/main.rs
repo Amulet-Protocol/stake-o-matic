@@ -192,7 +192,6 @@ impl std::fmt::Display for Cluster {
 }
 
 pub struct Config {
-    db_client: postgres::Client,
     json_rpc_url: String,
     cluster: Cluster,
     db_path: PathBuf,
@@ -287,7 +286,6 @@ impl Config {
     #[cfg(test)]
     pub fn default_for_test() -> Self {
         Self {
-            db_client: postgres::Client("localhost"),
             json_rpc_url: "https://api.mainnet-beta.solana.com".to_string(),
             cluster: Cluster::MainnetBeta,
             db_path: PathBuf::default(),
@@ -295,11 +293,11 @@ impl Config {
             markdown_path: None,
             dry_run: true,
             score_all: false,
-            score_max_commission: 8,
+            score_max_commission: 20,
             score_min_stake: sol_to_lamports(100.0),
-            score_concentration_point_discount: 1_500,
-            score_registered_validator_bonus: 0,
-            active_stake_std_multiplier: 3,
+            score_concentration_point_discount: 3,
+            score_registered_validator_bonus: 10,
+            active_stake_std_multiplier: 3.0,
             min_avg_position: 40.0,
             quality_block_producer_percentage: 15,
             max_poor_block_producer_percentage: 20,
@@ -347,7 +345,7 @@ fn app_version() -> String {
     })
 }
 
-fn get_config<I, T>(args: I) -> BoxResult<(Config, RpcClient, Option<Box<dyn GenericStakePool>>)> where
+fn get_config<I, T>(args: I) -> BoxResult<(Config, RpcClient, postgres::Client, Option<Box<dyn GenericStakePool>>)> where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone {
     let default_confirmed_block_cache_path = default_confirmed_block_cache_path()
@@ -769,7 +767,7 @@ fn get_config<I, T>(args: I) -> BoxResult<(Config, RpcClient, Option<Box<dyn Gen
             value_t!(matches, "concentration_point_discount", u32).unwrap_or(3),
             value_t!(matches, "registered_validator_bonus", u32).unwrap_or(10),
             value_t!(matches, "active_stake_std_multiplier", f32).unwrap_or(3.0),
-            value_t!(matches, "min_avg_position", f64).unwrap_or(50.0),
+            value_t!(matches, "min_avg_position", f64).unwrap_or(0.0),
         ),
         _ => (false, 0, 0, 0, 0, 0.0, 0.0),
     };
@@ -789,7 +787,6 @@ fn get_config<I, T>(args: I) -> BoxResult<(Config, RpcClient, Option<Box<dyn Gen
     let db_client = postgres::Client::connect(&url, tls_connector).expect("failed to connect to postgres");
 
     let config = Config {
-        db_client,
         json_rpc_url,
         cluster,
         db_path,
@@ -889,7 +886,7 @@ fn get_config<I, T>(args: I) -> BoxResult<(Config, RpcClient, Option<Box<dyn Gen
         process::exit(1);
     }
 
-    Ok((config, rpc_client, stake_pool))
+    Ok((config, rpc_client, db_client, stake_pool))
 }
 
 type ClassifyResult = (
@@ -984,10 +981,15 @@ fn classify_producers(
 fn classify_poor_voters(
     config: &Config,
     vote_account_info: &[VoteAccountInfo],
-) -> (ValidatorList, usize, u64, u64, bool) {
+) -> (ValidatorList, usize, u64, u64, u64, bool) {
     let avg_epoch_credits = vote_account_info
         .iter()
         .map(|vai| vai.epoch_credits)
+        .sum::<u64>()
+        / vote_account_info.len() as u64;
+    let avg_adj_credits = vote_account_info
+        .iter()
+        .map(|vai|(vai.epoch_credits as f64 * (100.0 - vai.commission as f64) / 100.0) as u64)
         .sum::<u64>()
         / vote_account_info.len() as u64;
 
@@ -1024,6 +1026,7 @@ fn classify_poor_voters(
         poor_voter_percentage,
         min_epoch_credits,
         avg_epoch_credits,
+        avg_adj_credits,
         too_many_poor_voters,
     )
 }
@@ -1335,6 +1338,7 @@ fn classify(
         poor_voter_percentage,
         min_epoch_credits,
         avg_epoch_credits,
+        avg_adj_credits,
         too_many_poor_voters,
     ) = classify_poor_voters(config, &vote_account_info);
 
@@ -1637,6 +1641,7 @@ fn classify(
                 .unwrap_or_default();
             stake_states.insert(0, (stake_state, reason.clone()));
 
+            let adj_credits = (epoch_credits as f64 * (100.0 - commission as f64) / 100.0) as u64;
             validator_classifications.insert(
                 identity,
                 ValidatorClassification {
@@ -1645,7 +1650,8 @@ fn classify(
                     stake_state,
                     score_data: Some(ScoreData {
                         epoch_credits,
-                        average_position: epoch_credits as f64 / avg_epoch_credits as f64 * 50.0,
+                        adj_credits,
+                        average_position: adj_credits as f64 / avg_adj_credits as f64 * 50.0,
                         score_discounts,
                         commission,
                         active_stake,
@@ -1687,7 +1693,7 @@ fn classify(
     })
 }
 
-fn fetch_store_validators(mut config: Config, rpc_client: RpcClient,
+fn fetch_store_validators(config: Config, rpc_client: RpcClient, mut db_client: postgres::Client,
                           optional_stake_pool: Option<Box<dyn GenericStakePool>>) -> BoxResult<()> {
     info!("Loading participants...");
     let participants = match get_participants_with_state(
@@ -1759,10 +1765,10 @@ fn fetch_store_validators(mut config: Config, rpc_client: RpcClient,
             .into_current();
 
     let query: &str = "SELECT distinct(epoch) from validators where epoch=$1";
-    let prepare_stmt = config.db_client.prepare_typed(query, &[Type::INT8])
+    let prepare_stmt = db_client.prepare_typed(query, &[Type::INT8])
         .expect("failed to create prepared statement");
 
-    let result = config.db_client.query(&prepare_stmt, &[&(epoch as i64)])
+    let result = db_client.query(&prepare_stmt, &[&(epoch as i64)])
         .expect("failed to query item");
     if result.len() > 0 {
         info!("Classification for epoch {} already exists", epoch);
@@ -1869,7 +1875,7 @@ fn fetch_store_validators(mut config: Config, rpc_client: RpcClient,
     }
 
     //conditional to: matches.is_present("markdown")
-    generate_markdown(epoch, &mut config)?;
+    generate_markdown(epoch, config, db_client)?;
 
     Ok(())
 }
@@ -1877,22 +1883,22 @@ fn fetch_store_validators(mut config: Config, rpc_client: RpcClient,
 fn main() -> BoxResult<()> {
     solana_logger::setup_with_default("solana=info");
 
-    let (config, rpc_client, optional_stake_pool) =
+    let (config, rpc_client, db_client, optional_stake_pool) =
         get_config(std::env::args_os())?;
 
-    fetch_store_validators(config, rpc_client, optional_stake_pool)
+    fetch_store_validators(config, rpc_client, db_client, optional_stake_pool)
 }
 
 pub fn run(args: &Vec<String>) -> BoxResult<()> {
     solana_logger::setup_with_default("solana=info");
 
-    let (config, rpc_client, optional_stake_pool) =
+    let (config, rpc_client, db_client, optional_stake_pool) =
         get_config(args)?;
 
-    fetch_store_validators(config, rpc_client, optional_stake_pool)
+    fetch_store_validators(config, rpc_client, db_client, optional_stake_pool)
 }
 
-fn generate_markdown(epoch: Epoch, config: &mut Config) -> BoxResult<()> {
+fn generate_markdown(epoch: Epoch, config: Config, mut db_client: postgres::Client) -> BoxResult<()> {
     let markdown_path = match config.markdown_path.as_ref() {
         Some(d) => d,
         None => return Ok(()), // exit if !matches.is_present("markdown")
@@ -1922,7 +1928,7 @@ fn generate_markdown(epoch: Epoch, config: &mut Config) -> BoxResult<()> {
             for (identity, classification) in validator_classifications {
                 //epoch,keybase_id,name,identity,vote_address,score,average_position,commission,active_stake,epoch_credits,data_center_concentration,can_halt_the_network_group,stake_state,stake_state_reason,www_url
                 if let Some(score_data) = &classification.score_data {
-                    let score = score_data.score(config);
+                    let score = score_data.score(&config);
                     let csv_line = format!(
                         r#"{},"{}","{}","{}","{}",{},{},{},{},{},{:.4},{},"{:?}","{}","{}",{}"#,
                         epoch,
@@ -1947,7 +1953,7 @@ fn generate_markdown(epoch: Epoch, config: &mut Config) -> BoxResult<()> {
             }
 
             let query = "COPY validators FROM STDIN DELIMITER ',' CSV HEADER";
-            let mut writer = config.db_client.copy_in(query)?;
+            let mut writer = db_client.copy_in(query)?;
             writer.write_all(&validator_detail_csv.join("\n").into_bytes())?;
             writer.finish()?;
         }

@@ -34,6 +34,7 @@ pub struct ByIdentityInfo {
 pub struct ScoreData {
     /// epoch_credits is the base score
     pub epoch_credits: u64,
+    pub adj_credits: u64,
     /// 50 => Average, 0=>worst, 100=twice the average
     pub average_position: f64,
     pub score_discounts: ScoreDiscounts,
@@ -123,9 +124,13 @@ impl ScoreData {
                 0
             }) as f64;
 
+            let avg_position_bonus = if self.average_position - 49.0 > 0.0 {
+                self.average_position - 49.0
+            } else {
+                0.0
+            };
             let total_percentage = (100.0 - discount_because_commission - discount_because_active_stake
-                - discount_because_data_center_concentration + bonus_because_validator_program) / 100.0;
-
+                - discount_because_data_center_concentration + avg_position_bonus + bonus_because_validator_program) / 100.0;
             //result
             (self.epoch_credits as f64 * total_percentage) as u64
         }
@@ -313,6 +318,8 @@ impl EpochClassification {
 
 #[cfg(test)]
 mod test {
+    use solana_account_decoder::parse_account_data::ParsableAccount::Config;
+    use solana_sdk::native_token::sol_to_lamports;
     use super::*;
 
     #[test]
@@ -330,5 +337,28 @@ mod test {
         ]);
         assert!(!vc.staked_for(3, 3));
         assert!(vc.staked_for(2, 3));
+    }
+
+    #[test]
+    fn test_score_data_calculation() {
+        let score = ScoreData {
+            epoch_credits: 1000,
+            adj_credits: 900,
+            average_position: 52.5,
+            score_discounts: ScoreDiscounts {
+                can_halt_the_network_group: false,
+                is_registered_delegation_group: true
+            },
+            commission: 10,
+            active_stake: sol_to_lamports(54000.0),
+            data_center_concentration: 0.5,
+            validators_app_info: ByIdentityInfo::default(),
+            total_active_stake: sol_to_lamports(500000.0),
+            mean_active_stake: sol_to_lamports(32000.0),
+            std_active_stake: sol_to_lamports(45000.0)
+        };
+        let score = score.score(&crate::Config::default_for_test());
+        let expected_score = 1020;
+        assert_eq!(score, expected_score);
     }
 }
