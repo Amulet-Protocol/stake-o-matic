@@ -44,7 +44,9 @@ pub struct ScoreData {
     pub validators_app_info: ByIdentityInfo,
     pub total_active_stake: u64,
     pub mean_active_stake: u64,
-    pub std_active_stake: u64
+    pub std_active_stake: u64,
+    pub inflation_reward: f64,
+    pub inflation_post_balance: f64
 }
 
 #[derive(Default, Clone, Deserialize, Serialize)]

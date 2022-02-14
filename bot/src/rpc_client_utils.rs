@@ -178,6 +178,13 @@ pub struct VoteAccountInfo {
     pub epoch_credits: u64,
 }
 
+pub struct InflationRewardInfo {
+    pub identity: Pubkey,
+    pub effective_slot: u64,
+    pub post_balance: f64,
+    pub amount: f64
+}
+
 pub fn mean_std(data: &[u64]) -> (u64, u64) {
     let sum = data.iter().sum::<u64>() as f64;
     let count = data.len();
@@ -188,6 +195,32 @@ pub fn mean_std(data: &[u64]) -> (u64, u64) {
     }).sum::<f64>() / count as f64;
 
     (mean as u64, variance.sqrt() as u64)
+}
+
+pub fn get_inflation_rewards(
+    rpc_client: &RpcClient,
+    vote_accounts: &Vec<VoteAccountInfo>,
+    epoch: Epoch
+) -> Result<HashMap<Pubkey, InflationRewardInfo>, Box<dyn error::Error>>{
+    let mut inflation_reward_info = HashMap::<Pubkey, InflationRewardInfo>::new();
+    let addresses: Vec<Pubkey> = vote_accounts.iter().map(|v| v.vote_address).collect();
+    let batch_size = 700;
+    let batches = addresses.chunks(batch_size);
+    for batch in batches {
+        let inflation_rewards =
+            rpc_client.get_inflation_reward(batch, Some(epoch))?;
+        for (i, address) in batch.iter().enumerate() {
+            if let Some(inflation_reward) = &inflation_rewards[i] {
+                inflation_reward_info.insert(address.clone(), InflationRewardInfo {
+                    identity: address.clone(),
+                    effective_slot: inflation_reward.effective_slot,
+                    post_balance: lamports_to_sol(inflation_reward.post_balance),
+                    amount: lamports_to_sol(inflation_reward.amount)
+                });
+            }
+        }
+    }
+    Ok(inflation_reward_info)
 }
 
 pub fn get_vote_account_info(
