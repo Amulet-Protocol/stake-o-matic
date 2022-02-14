@@ -1254,7 +1254,10 @@ fn classify(
         get_vote_account_info(rpc_client, last_epoch)?;
 
     let inflation_rewards =
-        get_inflation_rewards(&rpc_client, &vote_account_info, epoch-1)?;
+        match get_inflation_rewards(&rpc_client, &vote_account_info, epoch-1) {
+            Ok(inflation_rewards) => { inflation_rewards }
+            Err(error) => { HashMap::new() }
+        };
 
     // compute cumulative_stake_limit => active_stake of the last validator inside the can-halt-the-network group
     // we later set score=0 to all validators whose stake >= concentrated_validators_stake_limit
