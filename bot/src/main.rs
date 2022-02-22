@@ -1972,9 +1972,16 @@ fn generate_markdown(epoch: Epoch, config: Config, mut db_client: postgres::Clie
             }
 
             let query = "COPY validators FROM STDIN DELIMITER ',' CSV HEADER";
-            let mut writer = db_client.copy_in(query)?;
-            writer.write_all(&validator_detail_csv.join("\n").into_bytes())?;
-            writer.finish()?;
+            match db_client.copy_in(query) {
+                Ok(mut writer) => {
+                    writer.write_all(&validator_detail_csv.join("\n").into_bytes())?;
+                    match writer.finish() {
+                        Ok(result) => info!("Finished writing to database. Total records: {}", result),
+                        Err(e) => info!("Error copying in query: {}", e.to_string())
+                    }
+                }
+                Err(e) => info!("Error copying in query: {}", e.to_string())
+            }
         }
     }
 
