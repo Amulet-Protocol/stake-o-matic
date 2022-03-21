@@ -1,3 +1,11 @@
+use std::error::Error;
+use std::io::ErrorKind;
+use std::ops::Deref;
+use borsh::schema::Definition::Tuple;
+use solana_client::rpc_response::RpcInflationReward;
+use solana_sdk::epoch_schedule::EpochSchedule;
+use rayon::prelude::*;
+use std::sync::{Arc, Mutex};
 use {
     log::*,
     solana_client::{
@@ -8,6 +16,7 @@ use {
         rpc_request::MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS,
         rpc_response::{RpcVoteAccountInfo, RpcVoteAccountStatus},
     },
+    serde::{Deserialize, Serialize},
     solana_sdk::{
         clock::Epoch,
         native_token::*,
@@ -15,6 +24,13 @@ use {
         signature::{Keypair, Signature, Signer},
         stake,
         transaction::Transaction,
+        account::from_account,
+        account_utils::StateMut,
+        clock::Clock,
+        stake::state::StakeState,
+        commitment_config::CommitmentConfig,
+        stake_history::StakeHistory,
+        sysvar,
     },
     std::{
         collections::{HashMap, HashSet},
@@ -24,6 +40,8 @@ use {
         time::Duration,
     },
 };
+use crate::data_center_info::get;
+use crate::sysvar::stake_history;
 
 pub struct SendAndConfirmTransactionResult {
     pub succeeded: HashSet<Signature>,
@@ -168,6 +186,7 @@ pub fn send_and_confirm_transactions(
     })
 }
 
+#[derive(Default, Copy, Clone, Deserialize, Serialize)]
 pub struct VoteAccountInfo {
     pub identity: Pubkey,
     pub vote_address: Pubkey,
@@ -178,11 +197,26 @@ pub struct VoteAccountInfo {
     pub epoch_credits: u64,
 }
 
+#[derive(Default, Copy, Clone, Deserialize, Serialize)]
 pub struct InflationRewardInfo {
     pub identity: Pubkey,
     pub effective_slot: u64,
     pub post_balance: f64,
-    pub amount: f64
+    pub amount: f64,
+    pub apy: f64
+}
+
+#[derive(Default, Copy, Clone, Deserialize, Serialize)]
+pub struct StakeAccountInfo {
+    pub stake_account: Pubkey,
+    pub voter_pubkey: Pubkey,
+    pub stake: u64,
+    pub activation_epoch: Epoch,
+    pub deactivation_epoch: Epoch,
+    pub warmup_cooldown_rate: f64,
+    pub effective: u64,
+    pub activating: u64,
+    pub deactivating: u64
 }
 
 pub fn mean_std(data: &[u64]) -> (u64, u64) {
@@ -197,28 +231,111 @@ pub fn mean_std(data: &[u64]) -> (u64, u64) {
     (mean as u64, variance.sqrt() as u64)
 }
 
+pub fn get_epoch_boundary_timestamps(
+    rpc_client: &RpcClient,
+    reward: &RpcInflationReward,
+    epoch_schedule: &EpochSchedule,
+) -> Result<(i64, i64), Box<dyn std::error::Error>> {
+    let epoch_end_time = rpc_client.get_block_time(reward.effective_slot)?;
+    let mut epoch_start_slot = epoch_schedule.get_first_slot_in_epoch(reward.epoch);
+    let epoch_start_time = loop {
+        if epoch_start_slot >= reward.effective_slot {
+            return Err("epoch_start_time not found".to_string().into());
+        }
+        match rpc_client.get_block_time(epoch_start_slot) {
+            Ok(block_time) => {
+                break block_time;
+            }
+            Err(_) => {
+                epoch_start_slot += 1;
+            }
+        }
+    };
+    Ok((epoch_start_time, epoch_end_time))
+}
+
+pub fn get_reward_apy(
+    reward: &RpcInflationReward,
+    epoch_start_time: i64,
+    epoch_end_time: i64,
+) -> Option<f64> {
+    pub const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+    let wallclock_epoch_duration = epoch_end_time.checked_sub(epoch_start_time)?;
+    if reward.post_balance > reward.amount {
+        let rate_change = reward.amount as f64 / (reward.post_balance - reward.amount) as f64;
+        let wallclock_epochs_per_year =
+            (SECONDS_PER_DAY * 365) as f64 / wallclock_epoch_duration as f64;
+        let apr = rate_change * wallclock_epochs_per_year;
+
+        Some(apr)
+    } else {
+        None
+    }
+}
+
 pub fn get_inflation_rewards(
     rpc_client: &RpcClient,
     vote_accounts: &Vec<VoteAccountInfo>,
     epoch: Epoch
 ) -> Result<HashMap<Pubkey, InflationRewardInfo>, Box<dyn error::Error>>{
-    let mut inflation_reward_info = HashMap::<Pubkey, InflationRewardInfo>::new();
-    let addresses: Vec<Pubkey> = vote_accounts.iter().map(|v| v.vote_address).collect();
+    // get all the stake accounts
+    let stake_accounts = get_stake_accounts(rpc_client)?;
+    // (vote_account, stake_account)
+    let addresses: Vec<(Pubkey, Pubkey)> = vote_accounts.into_iter().flat_map(|vote_account| {
+        // filter stake account by the highest stake and not activating or deactivating
+        let stakes = stake_accounts.get(&vote_account.vote_address);
+        stakes.map(|accounts| {
+            let mut accounts = accounts.to_vec();
+            accounts.sort_by(|a1, a2| a2.effective.cmp(&a1.effective));
+            accounts.into_iter()
+                .filter(|s| s.effective > 0 && s.activating == 0 && s.deactivating == 0)
+                .map(|a| (vote_account.vote_address, a.stake_account)).next()
+        }).flatten()
+    }).collect();
     let batch_size = 700;
     let batches = addresses.chunks(batch_size);
+    let mut rewards = Vec::<(Pubkey, RpcInflationReward)>::new();
     for batch in batches {
+        let stake_addresses: Vec<Pubkey> = batch.into_iter().map(|b| b.1).collect();
         let inflation_rewards =
-            rpc_client.get_inflation_reward(batch, Some(epoch))?;
-        for (i, address) in batch.iter().enumerate() {
+            rpc_client.get_inflation_reward(&stake_addresses, Some(epoch))?;
+        for (i, (vote_account, stake_account)) in batch.iter().enumerate() {
             if let Some(inflation_reward) = &inflation_rewards[i] {
-                inflation_reward_info.insert(address.clone(), InflationRewardInfo {
+                rewards.push((vote_account.clone(), inflation_reward.clone()));
+            }
+        }
+    }
+
+    let epoch_schedule = rpc_client.get_epoch_schedule()?;
+    // Calculate apy
+    let mut epoch_cache = Arc::new(Mutex::new(HashMap::<u64, (i64, i64)>::new()));
+    let inflation_reward_infos: Vec<InflationRewardInfo> = rewards.into_par_iter().flat_map(|r| {
+        let (address, inflation_reward) = r;
+        let epoch_time = match epoch_cache.lock().unwrap().get(&inflation_reward.effective_slot).cloned() {
+            Some(epoch) => Ok(epoch),
+            None => {
+                get_epoch_boundary_timestamps(rpc_client, &inflation_reward, &epoch_schedule)
+            }
+        };
+        match epoch_time {
+            Ok((epoch_start_time, epoch_end_time)) => {
+                epoch_cache.lock().unwrap().insert(inflation_reward.effective_slot, (epoch_start_time, epoch_end_time));
+                let reward_apy = get_reward_apy(&inflation_reward, epoch_start_time, epoch_end_time);
+                Some(InflationRewardInfo {
                     identity: address.clone(),
                     effective_slot: inflation_reward.effective_slot,
                     post_balance: lamports_to_sol(inflation_reward.post_balance),
-                    amount: lamports_to_sol(inflation_reward.amount)
-                });
+                    amount: lamports_to_sol(inflation_reward.amount),
+                    apy: reward_apy.unwrap_or(0.0)
+                })
             }
+            _ => None
         }
+    }).collect();
+
+    let mut inflation_reward_info = HashMap::<Pubkey, InflationRewardInfo>::new();
+    for reward in inflation_reward_infos {
+        inflation_reward_info.insert(reward.identity, reward);
     }
     Ok(inflation_reward_info)
 }
@@ -289,6 +406,59 @@ pub fn get_vote_account_info(
         mean_active_stake,
         std_active_stake
     ))
+}
+
+pub fn get_stake_accounts(
+    rpc_client: &RpcClient,
+) -> Result<HashMap<Pubkey, Vec<StakeAccountInfo>>, Box<dyn error::Error>> {
+    let mut all_stake_addresses = HashMap::<Pubkey, Vec<StakeAccountInfo>>::new();
+    let all_stake_accounts = rpc_client.get_program_accounts_with_config(
+        &stake::program::id(),
+        RpcProgramAccountsConfig {
+            account_config: RpcAccountInfoConfig {
+                encoding: Some(solana_account_decoder::UiAccountEncoding::Base64),
+                commitment: Some(rpc_client.commitment()),
+                ..RpcAccountInfoConfig::default()
+            },
+            ..RpcProgramAccountsConfig::default()
+        },
+    )?;
+    let stake_history_account = rpc_client
+        .get_account_with_commitment(&sysvar::stake_history::id(), CommitmentConfig::finalized())?
+        .value
+        .unwrap();
+
+    let stake_history: StakeHistory =
+        from_account(&stake_history_account).ok_or("Failed to deserialize stake history")?;
+    let clock_account = rpc_client.get_account(&sysvar::clock::id())?;
+    let clock: Clock = from_account(&clock_account).ok_or("Failed to deserialize clock sysvar")?;
+    let current_epoch = clock.epoch;
+    for (stake_pubkey, stake_account) in all_stake_accounts {
+        if let Ok(stake_state) = stake_account.state() {
+            match stake_state {
+                StakeState::Stake(_, stake) => {
+                    let (effective, activating, deactivating) = stake
+                        .delegation
+                        .stake_activating_and_deactivating(current_epoch, Some(&stake_history), true);
+                    let stake_account_info = StakeAccountInfo {
+                        stake_account: stake_pubkey,
+                        voter_pubkey: stake.delegation.voter_pubkey,
+                        stake: stake.delegation.stake,
+                        activation_epoch: stake.delegation.activation_epoch,
+                        deactivation_epoch: stake.delegation.deactivation_epoch,
+                        warmup_cooldown_rate: stake.delegation.warmup_cooldown_rate,
+                        effective,
+                        activating,
+                        deactivating
+                    };
+                    all_stake_addresses.entry(stake.delegation.voter_pubkey)
+                        .or_insert_with(Vec::new).push(stake_account_info);
+                }
+                _ => {}
+            }
+        }
+    };
+    Ok(all_stake_addresses)
 }
 
 pub fn get_all_stake(

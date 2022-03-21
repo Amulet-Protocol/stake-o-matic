@@ -14,6 +14,7 @@ use {
         path::{Path, PathBuf},
     },
 };
+use crate::InflationRewardInfo;
 
 #[derive(Default, Clone, Deserialize, Serialize)]
 pub struct ScoreDiscounts {
@@ -27,6 +28,8 @@ pub struct ByIdentityInfo {
     pub keybase_id: String,
     pub name: String,
     pub www_url: String,
+    pub description: String,
+    pub software_version: String
 }
 
 #[derive(Default, Clone, Deserialize, Serialize)]
@@ -45,8 +48,7 @@ pub struct ScoreData {
     pub total_active_stake: u64,
     pub mean_active_stake: u64,
     pub std_active_stake: u64,
-    pub inflation_reward: f64,
-    pub inflation_post_balance: f64
+    pub inflation_reward: Option<InflationRewardInfo>
 }
 
 #[derive(Default, Clone, Deserialize, Serialize)]

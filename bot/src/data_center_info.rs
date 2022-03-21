@@ -130,6 +130,8 @@ pub fn get(cluster: &str) -> Result<DataCenters, Box<dyn error::Error>> {
                 keybase_id: String::from(v.keybase_id.as_deref().unwrap_or("")),
                 name: String::from(v.name.as_deref().unwrap_or("")),
                 www_url: String::from(v.www_url.as_deref().unwrap_or("")),
+                description: String::from(v.details.as_deref().unwrap_or("")),
+                software_version: String::from(v.software_version.as_deref().unwrap_or("")),
             },
         );
 

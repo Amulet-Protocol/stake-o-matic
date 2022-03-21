@@ -1,3 +1,4 @@
+use std::time::Instant;
 use openssl::ssl::{SslConnector, SslMethod};
 use postgres_openssl::MakeTlsConnector;
 use postgres::types::Type;
@@ -1253,11 +1254,14 @@ fn classify(
         mean_active_stake, std_active_stake) =
         get_vote_account_info(rpc_client, last_epoch)?;
 
+    let start = Instant::now();
+    info!("Get inflation rewards");
     let inflation_rewards =
         match get_inflation_rewards(&rpc_client, &vote_account_info, epoch-1) {
             Ok(inflation_rewards) => { inflation_rewards }
             Err(error) => { HashMap::new() }
         };
+    info!("Response took {:?}", Instant::now().duration_since(start));
 
     // compute cumulative_stake_limit => active_stake of the last validator inside the can-halt-the-network group
     // we later set score=0 to all validators whose stake >= concentrated_validators_stake_limit
@@ -1655,7 +1659,7 @@ fn classify(
                 .unwrap_or_default();
             stake_states.insert(0, (stake_state, reason.clone()));
 
-            let inflation_reward = inflation_rewards.get(&vote_address);
+            let inflation_reward = inflation_rewards.get(&vote_address).cloned();
             let adj_credits = (epoch_credits as f64 * (100.0 - commission as f64) / 100.0) as u64;
             validator_classifications.insert(
                 identity,
@@ -1675,8 +1679,7 @@ fn classify(
                         total_active_stake,
                         mean_active_stake,
                         std_active_stake,
-                        inflation_reward: inflation_reward.map(|i| i.amount).unwrap_or(0.0),
-                        inflation_post_balance: inflation_reward.map(|i| i.post_balance).unwrap_or(0.0)
+                        inflation_reward
                     }),
                     stake_states: Some(stake_states),
                     stake_action: None,
@@ -1931,7 +1934,7 @@ fn generate_markdown(epoch: Epoch, config: Config, mut db_client: postgres::Clie
         if let Some(ref validator_classifications) = epoch_classification.validator_classifications
         {
             let mut validator_detail_csv = vec![];
-            validator_detail_csv.push("epoch,keybase_id,name,identity,vote_address,score,average_position,commission,active_stake,epoch_credits,data_center_concentration,can_halt_the_network_group,stake_state,stake_state_reason,www_url,is_delegation_program,inflation_reward,inflation_post_balance".into());
+            validator_detail_csv.push("epoch,keybase_id,name,identity,vote_address,score,average_position,commission,active_stake,epoch_credits,data_center_concentration,can_halt_the_network_group,stake_state,stake_state_reason,www_url,is_delegation_program,inflation_reward,inflation_post_balance,apy,software_version,description".into());
             let mut validator_classifications =
                 validator_classifications.iter().collect::<Vec<_>>();
             // sort by credits, desc
@@ -1943,11 +1946,11 @@ fn generate_markdown(epoch: Epoch, config: Config, mut db_client: postgres::Clie
                     .cmp(&a.1.score_data.as_ref().unwrap().epoch_credits)
             });
             for (identity, classification) in validator_classifications {
-                //epoch,keybase_id,name,identity,vote_address,score,average_position,commission,active_stake,epoch_credits,data_center_concentration,can_halt_the_network_group,stake_state,stake_state_reason,www_url
+                //epoch,keybase_id,name,identity,vote_address,score,average_position,commission,active_stake,epoch_credits,data_center_concentration,can_halt_the_network_group,stake_state,stake_state_reason,www_url,inflation_reward,inflation_post_balance,apy,software_version,description
                 if let Some(score_data) = &classification.score_data {
                     let score = score_data.score(&config);
                     let csv_line = format!(
-                        r#"{},"{}","{}","{}","{}",{},{},{},{},{},{:.4},{},"{:?}","{}","{}",{}, {}, {}"#,
+                        r#"{},"{}","{}","{}","{}",{},{},{},{},{},{:.4},{},"{:?}","{}","{}",{},{},{},{},"{}","{}""#,
                         epoch,
                         score_data.validators_app_info.keybase_id,
                         score_data.validators_app_info.name,
@@ -1964,8 +1967,11 @@ fn generate_markdown(epoch: Epoch, config: Config, mut db_client: postgres::Clie
                         classification.stake_state_reason,
                         score_data.validators_app_info.www_url,
                         classification.participant.is_some(),
-                        score_data.inflation_reward,
-                        score_data.inflation_post_balance
+                        score_data.inflation_reward.map(|i| i.amount).unwrap_or(0.0),
+                        score_data.inflation_reward.map(|i| i.post_balance).unwrap_or(0.0),
+                        score_data.inflation_reward.map(|i| i.apy).unwrap_or(0.0),
+                        score_data.validators_app_info.software_version,
+                        score_data.validators_app_info.description,
                     );
                     validator_detail_csv.push(csv_line);
                 }
