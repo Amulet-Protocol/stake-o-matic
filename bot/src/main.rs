@@ -773,26 +773,16 @@ fn get_config<I, T>(args: I) -> BoxResult<(Config, RpcClient, postgres::Client, 
         _ => (false, 0, 0, 0, 0, 0.0, 0.0),
     };
 
-    let pg_host = std::env::var("POSTGRES_HOST").expect("missing environment variable POSTGRES_HOST");
-    let pg_user = std::env::var("POSTGRES_USER").expect("missing environment variable POSTGRES_USER");
-    let pg_password = std::env::var("POSTGRES_PASSWORD").expect("missing environment variable POSTGRES_PASSWORD");
-    let pg_dbname = std::env::var("POSTGRES_DBNAME").unwrap_or("postgres".to_string());
+    let pg_conn_string = std::env::var("POSTGRES_CONNECTION_STRING")
+        .expect("missing environment variable POSTGRES_CONNECTION_STRING");
 
     let builder = SslConnector::builder(SslMethod::tls()).unwrap();
     let tls_connector = MakeTlsConnector::new(builder.build());
 
-    let db_client = if pg_host == "localhost" {
-        let url = format!(
-            "host={} port=5432 user={} password={} dbname={}",
-            pg_host, pg_user, pg_password, pg_dbname
-        );
-        postgres::Client::connect(&url, postgres::NoTls)
+    let db_client = if pg_conn_string.contains("localhost") {
+        postgres::Client::connect(&pg_conn_string, postgres::NoTls)
     } else {
-        let url = format!(
-            "host={} port=5432 user={} password={} dbname={} sslmode=require",
-            pg_host, pg_user, pg_password, pg_dbname
-        );
-        postgres::Client::connect(&url, tls_connector)
+        postgres::Client::connect(&pg_conn_string, tls_connector)
     }.expect("failed to connect to postgres");
 
     let config = Config {
