@@ -1705,6 +1705,23 @@ fn classify(
 
 fn fetch_store_validators(config: Config, rpc_client: RpcClient, mut db_client: postgres::Client,
                           optional_stake_pool: Option<Box<dyn GenericStakePool>>) -> BoxResult<()> {
+    let epoch = rpc_client.get_epoch_info()?.epoch;
+    info!("Epoch: {:?}", epoch);
+    if epoch == 0 {
+        return Ok(());
+    }
+
+    let query: &str = "SELECT distinct(epoch) from validators where epoch=$1";
+    let prepare_stmt = db_client.prepare_typed(query, &[Type::INT8])
+        .expect("failed to create prepared statement");
+
+    let result = db_client.query(&prepare_stmt, &[&(epoch as i64)])
+        .expect("failed to query item");
+    if result.len() > 0 {
+        info!("Classification for epoch {} already exists", epoch);
+        return Ok(());
+    }
+
     info!("Loading participants...");
     let participants = match get_participants_with_state(
         &RpcClient::new("https://api.mainnet-beta.solana.com".to_string()),
@@ -1760,12 +1777,6 @@ fn fetch_store_validators(config: Config, rpc_client: RpcClient, mut db_client: 
         Notifier::default()
     };
 
-    let epoch = rpc_client.get_epoch_info()?.epoch;
-    info!("Epoch: {:?}", epoch);
-    if epoch == 0 {
-        return Ok(());
-    }
-
     info!("Data directory: {}", config.cluster_db_path().display());
 
     let previous_epoch_classification =
@@ -1773,17 +1784,6 @@ fn fetch_store_validators(config: Config, rpc_client: RpcClient, mut db_client: 
             .map(|p| p.1)
             .unwrap_or_default()
             .into_current();
-
-    let query: &str = "SELECT distinct(epoch) from validators where epoch=$1";
-    let prepare_stmt = db_client.prepare_typed(query, &[Type::INT8])
-        .expect("failed to create prepared statement");
-
-    let result = db_client.query(&prepare_stmt, &[&(epoch as i64)])
-        .expect("failed to query item");
-    if result.len() > 0 {
-        info!("Classification for epoch {} already exists", epoch);
-        return Ok(());
-    }
 
     let (mut epoch_classification, first_time, post_notifications) =
         (
