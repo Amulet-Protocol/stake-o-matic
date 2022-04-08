@@ -986,11 +986,13 @@ fn classify_poor_voters(
         .map(|vai| vai.epoch_credits)
         .sum::<u64>()
         / vote_account_info.len() as u64;
-    let avg_adj_credits = vote_account_info
+    // filter the account that has more than 300000 epoch credits
+    let filtered_accounts: Vec<u64> = vote_account_info
         .iter()
         .map(|vai|(vai.epoch_credits as f64 * (100.0 - vai.commission as f64) / 100.0) as u64)
-        .sum::<u64>()
-        / vote_account_info.len() as u64;
+        .filter(|&c| c > 300000 as u64).collect();
+    let avg_adj_credits = filtered_accounts.iter().sum::<u64>()
+        / filtered_accounts.len() as u64;
 
     let min_epoch_credits =
         avg_epoch_credits * (100 - config.min_epoch_credit_percentage_of_average as u64) / 100;
