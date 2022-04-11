@@ -206,7 +206,7 @@ pub struct InflationRewardInfo {
     pub apy: f64
 }
 
-#[derive(Default, Copy, Clone, Deserialize, Serialize)]
+#[derive(Default, Copy, Clone, Deserialize, Serialize, Debug)]
 pub struct StakeAccountInfo {
     pub stake_account: Pubkey,
     pub voter_pubkey: Pubkey,
@@ -297,7 +297,8 @@ pub fn get_inflation_rewards(
             let mut accounts = accounts.to_vec();
             accounts.sort_by(|a1, a2| a2.effective.cmp(&a1.effective));
             accounts.into_iter()
-                .filter(|s| s.effective > 0 && s.activating == 0 && s.deactivating == 0)
+                .filter(|s| s.effective > 0 && s.activating == 0
+                    && s.deactivating == 0 && s.deactivation_epoch == Epoch::MAX)
                 .map(|a| (vote_account.vote_address, a.stake_account)).next()
         }).flatten()
     }).collect();

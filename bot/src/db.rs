@@ -93,6 +93,7 @@ impl ScoreData {
             // if config.min_avg_position=100 => everybody passes
             // if config.min_avg_position=50 => only validators above avg pass
             || self.commission > config.score_max_commission
+            || self.inflation_reward.map(|i| i.apy).is_none()
         {
             0
         } else {
