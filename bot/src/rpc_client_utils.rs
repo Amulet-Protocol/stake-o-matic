@@ -289,6 +289,7 @@ pub fn get_inflation_rewards(
 ) -> Result<HashMap<Pubkey, InflationRewardInfo>, Box<dyn error::Error>>{
     // get all the stake accounts
     let stake_accounts = get_stake_accounts(rpc_client)?;
+    info!("Stake accounts len: {}", stake_accounts.len());
     // (vote_account, stake_account)
     let addresses: Vec<(Pubkey, Pubkey)> = vote_accounts.into_iter().flat_map(|vote_account| {
         // filter stake account by the highest stake and not activating or deactivating
@@ -305,6 +306,7 @@ pub fn get_inflation_rewards(
     let batch_size = 700;
     let batches = addresses.chunks(batch_size);
     let mut rewards = Vec::<(Pubkey, RpcInflationReward)>::new();
+    info!("Get inflation rewards: {} addresses", addresses.len());
     for batch in batches {
         let stake_addresses: Vec<Pubkey> = batch.into_iter().map(|b| b.1).collect();
         let inflation_rewards =
@@ -318,6 +320,7 @@ pub fn get_inflation_rewards(
 
     let epoch_schedule = rpc_client.get_epoch_schedule()?;
     // Calculate apy
+    info!("Calculate APY");
     let mut epoch_cache = Arc::new(Mutex::new(HashMap::<u64, (i64, i64)>::new()));
     let inflation_reward_infos: Vec<InflationRewardInfo> = rewards.into_par_iter().flat_map(|r| {
         let (address, inflation_reward) = r;
