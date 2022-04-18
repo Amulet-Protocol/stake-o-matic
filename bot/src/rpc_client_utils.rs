@@ -438,7 +438,8 @@ pub fn get_vote_account_info(
         }
     }
 
-    let (mean_active_stake, std_active_stake) = mean_std(&active_stakes);
+    let stakes = active_stakes.into_iter().filter(|&s| s > 0).collect::<Vec<u64>>();
+    let (mean_active_stake, std_active_stake) = mean_std(&stakes);
 
     Ok((
         latest_vote_account_info
