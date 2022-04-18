@@ -2,6 +2,7 @@ use std::time::Instant;
 use openssl::ssl::{SslConnector, SslMethod};
 use postgres_openssl::MakeTlsConnector;
 use postgres::types::Type;
+use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
 use {
     crate::{db::*, generic_stake_pool::*, rpc_client_utils::*},
     clap::{
@@ -40,6 +41,7 @@ use {
         path::PathBuf,
         process,
         str::FromStr,
+        sync::Arc,
         time::Duration,
     },
     thiserror::Error,
@@ -194,6 +196,7 @@ impl std::fmt::Display for Cluster {
 
 pub struct Config {
     json_rpc_url: String,
+    websocket_url: String,
     cluster: Cluster,
     db_path: PathBuf,
     require_classification: bool,
@@ -785,8 +788,11 @@ fn get_config<I, T>(args: I) -> BoxResult<(Config, RpcClient, postgres::Client, 
         postgres::Client::connect(&pg_conn_string, tls_connector)
     }.expect("failed to connect to postgres");
 
+    let websocket_url = solana_cli_config::Config::compute_websocket_url(&json_rpc_url);
+
     let config = Config {
         json_rpc_url,
+        websocket_url,
         cluster,
         db_path,
         require_classification,
@@ -819,7 +825,7 @@ fn get_config<I, T>(args: I) -> BoxResult<(Config, RpcClient, postgres::Client, 
 
     info!("RPC URL: {}", config.json_rpc_url);
     let rpc_client =
-        RpcClient::new_with_timeout(config.json_rpc_url.clone(), Duration::from_secs(300));
+        RpcClient::new_with_timeout(config.json_rpc_url.clone(), Duration::from_secs(480));
 
     // Sanity check that the RPC endpoint is healthy before performing too much work
     {
@@ -867,6 +873,8 @@ fn get_config<I, T>(args: I) -> BoxResult<(Config, RpcClient, postgres::Client, 
         ("stake-pool", Some(matches)) => {
             let authorized_staker = keypair_of(matches, "authorized_staker").unwrap();
             let pool_address = pubkey_of(matches, "pool_address").unwrap();
+            let min_reserve_stake_balance =
+                sol_to_lamports(value_t_or_exit!(matches, "min_reserve_stake_balance", f64));
             let baseline_stake_amount =
                 sol_to_lamports(value_t_or_exit!(matches, "baseline_stake_amount", f64));
             Some(Box::new(stake_pool::new(
@@ -874,6 +882,7 @@ fn get_config<I, T>(args: I) -> BoxResult<(Config, RpcClient, postgres::Client, 
                 authorized_staker,
                 pool_address,
                 baseline_stake_amount,
+                min_reserve_stake_balance,
             )?))
         }
         _ => None,
@@ -1128,8 +1137,8 @@ fn get_self_stake_by_vote_account(
                 if *vote_account_authorized_withdrawer == meta.authorized.withdrawer {
                     let effective_stake = stake
                         .delegation
-                        .stake_activating_and_deactivating(epoch, Some(&stake_history), true)
-                        .0;
+                        .stake_activating_and_deactivating(epoch, Some(&stake_history))
+                        .effective;
                     if effective_stake > 0 {
                         *self_stake_by_vote_account.entry(*vote_address).or_default() +=
                             effective_stake;
@@ -1726,7 +1735,8 @@ fn fetch_store_validators(config: Config, rpc_client: RpcClient, mut db_client: 
 
     info!("Loading participants...");
     let participants = match get_participants_with_state(
-        &RpcClient::new("https://api.mainnet-beta.solana.com".to_string()),
+        &RpcClient::new_with_timeout("https://api.mainnet-beta.solana.com".to_string(),
+                                     Duration::from_secs(480)),
         Some(ParticipantState::Approved),
     ){
         Ok(participants) => participants,
@@ -1851,8 +1861,13 @@ fn fetch_store_validators(config: Config, rpc_client: RpcClient, mut db_client: 
             .collect();
 
         if let Some(mut stake_pool) = optional_stake_pool {
-            let (stake_pool_notes, validator_stake_actions, unfunded_validators) =
-                stake_pool.apply(&rpc_client, config.dry_run, &desired_validator_stake)?;
+            let (stake_pool_notes, validator_stake_actions, unfunded_validators, bonus_stake_amount) =
+                stake_pool.apply(
+                    Arc::new(rpc_client),
+                    &config.websocket_url,
+                    config.dry_run,
+                    &desired_validator_stake,
+                )?;
             notifications.extend(stake_pool_notes.clone());
             epoch_classification.notes.extend(stake_pool_notes);
             for identity in unfunded_validators {
@@ -1917,7 +1932,7 @@ fn generate_markdown(epoch: Epoch, config: Config, mut db_client: postgres::Clie
     };
     fs::create_dir_all(&markdown_path)?;
 
-    let mut list = vec![(
+    let list = vec![(
         epoch,
         EpochClassification::load(epoch, &config.cluster_db_path())?.into_current(),
     )];

@@ -1,21 +1,21 @@
 use {
     crate::{
         generic_stake_pool::*,
-        rpc_client_utils::{get_all_stake, send_and_confirm_transactions},
+        rpc_client_utils::{get_all_stake, send_and_confirm_transactions_with_spinner},
     },
     log::*,
     solana_client::{rpc_client::RpcClient, rpc_response::StakeActivationState},
     solana_sdk::{
-        account::Account,
         native_token::{Sol, LAMPORTS_PER_SOL},
         pubkey::Pubkey,
         signature::{Keypair, Signer},
-        stake::{self, instruction as stake_instruction, state::StakeState},
+        stake::{self, instruction as stake_instruction},
         transaction::Transaction,
     },
     std::{
         collections::{HashMap, HashSet},
         error,
+        sync::Arc,
     },
 };
 
@@ -46,7 +46,7 @@ pub fn new(
             "baseline stake amount too small: {}",
             Sol(baseline_stake_amount)
         )
-        .into());
+            .into());
     }
 
     if min_reserve_stake_balance < MIN_STAKE_ACCOUNT_BALANCE {
@@ -54,7 +54,7 @@ pub fn new(
             "minimum reserve stake balance is too small: {}",
             Sol(min_reserve_stake_balance)
         )
-        .into());
+            .into());
     }
 
     Ok(StakePool {
@@ -79,7 +79,7 @@ fn validator_stake_address(authorized_staker: Pubkey, vote_address: Pubkey) -> P
         &validator_stake_address_seed(vote_address),
         &stake::program::id(),
     )
-    .unwrap()
+        .unwrap()
 }
 
 fn validator_transient_stake_address(authorized_staker: Pubkey, vote_address: Pubkey) -> Pubkey {
@@ -88,17 +88,25 @@ fn validator_transient_stake_address(authorized_staker: Pubkey, vote_address: Pu
         &validator_transient_stake_address_seed(vote_address),
         &stake::program::id(),
     )
-    .unwrap()
+        .unwrap()
 }
 
 impl GenericStakePool for StakePool {
     fn apply(
         &mut self,
-        rpc_client: &RpcClient,
+        rpc_client: Arc<RpcClient>,
+        websocket_url: &str,
         dry_run: bool,
         desired_validator_stake: &[ValidatorStake],
-    ) -> Result<(EpochStakeNotes, ValidatorStakeActions, UnfundedValidators), Box<dyn error::Error>>
-    {
+    ) -> Result<
+        (
+            EpochStakeNotes,
+            ValidatorStakeActions,
+            UnfundedValidators,
+            u64,
+        ),
+        Box<dyn error::Error>,
+    > {
         let mut validator_stake_actions = HashMap::default();
 
         let mut inuse_stake_addresses = HashSet::default();
@@ -130,11 +138,12 @@ impl GenericStakePool for StakePool {
         }
 
         let (all_stake_addresses, all_stake_total_amount) =
-            get_all_stake(rpc_client, self.authorized_staker.pubkey())?;
+            get_all_stake(&rpc_client, self.authorized_staker.pubkey())?;
 
         info!("Merge orphaned stake into the reserve");
         merge_orphaned_stake_accounts(
-            rpc_client,
+            rpc_client.clone(),
+            websocket_url,
             &self.authorized_staker,
             &all_stake_addresses - &inuse_stake_addresses,
             self.reserve_stake_address,
@@ -142,7 +151,8 @@ impl GenericStakePool for StakePool {
 
         info!("Merge transient stake back into either the reserve or validator stake");
         merge_transient_stake_accounts(
-            rpc_client,
+            rpc_client.clone(),
+            websocket_url,
             &self.authorized_staker,
             desired_validator_stake,
             self.reserve_stake_address,
@@ -151,7 +161,8 @@ impl GenericStakePool for StakePool {
 
         info!("Create validator stake accounts if needed");
         create_validator_stake_accounts(
-            rpc_client,
+            rpc_client.clone(),
+            websocket_url,
             &self.authorized_staker,
             desired_validator_stake,
             self.reserve_stake_address,
@@ -197,16 +208,16 @@ impl GenericStakePool for StakePool {
         info!("Bonus stake amount: {}", Sol(bonus_stake_amount));
 
         let reserve_stake_balance = get_available_reserve_stake_balance(
-            rpc_client,
+            &rpc_client,
             self.reserve_stake_address,
             self.min_reserve_stake_balance,
         )
-        .map_err(|err| {
-            format!(
-                "Unable to get reserve stake account balance: {}: {}",
-                self.reserve_stake_address, err
-            )
-        })?;
+            .map_err(|err| {
+                format!(
+                    "Unable to get reserve stake account balance: {}: {}",
+                    self.reserve_stake_address, err
+                )
+            })?;
 
         info!(
             "Reserve stake available balance before updates: {}",
@@ -234,6 +245,7 @@ impl GenericStakePool for StakePool {
         let mut unfunded_validators = HashSet::default();
         distribute_validator_stake(
             rpc_client,
+            websocket_url,
             dry_run,
             &self.authorized_staker,
             desired_validator_stake
@@ -247,7 +259,12 @@ impl GenericStakePool for StakePool {
             &mut validator_stake_actions,
             &mut unfunded_validators,
         )?;
-        Ok((notes, validator_stake_actions, unfunded_validators))
+        Ok((
+            notes,
+            validator_stake_actions,
+            unfunded_validators,
+            bonus_stake_amount,
+        ))
     }
 }
 
@@ -278,7 +295,8 @@ fn get_available_reserve_stake_balance(
 }
 
 fn merge_orphaned_stake_accounts(
-    rpc_client: &RpcClient,
+    rpc_client: Arc<RpcClient>,
+    websocket_url: &str,
     authorized_staker: &Keypair,
     source_stake_addresses: HashSet<Pubkey>,
     reserve_stake_address: Pubkey,
@@ -324,9 +342,15 @@ fn merge_orphaned_stake_accounts(
         }
     }
 
-    if !send_and_confirm_transactions(rpc_client, false, transactions, authorized_staker)?
-        .failed
-        .is_empty()
+    if send_and_confirm_transactions_with_spinner(
+        rpc_client,
+        websocket_url,
+        false,
+        transactions,
+        authorized_staker,
+    )?
+        .iter()
+        .any(|err| err.is_some())
     {
         Err("Failed to merge orphaned stake accounts".into())
     } else {
@@ -335,7 +359,8 @@ fn merge_orphaned_stake_accounts(
 }
 
 fn merge_transient_stake_accounts(
-    rpc_client: &RpcClient,
+    rpc_client: Arc<RpcClient>,
+    websocket_url: &str,
     authorized_staker: &Keypair,
     desired_validator_stake: &[ValidatorStake],
     reserve_stake_address: Pubkey,
@@ -352,20 +377,10 @@ fn merge_transient_stake_accounts(
         let transient_stake_address =
             validator_transient_stake_address(authorized_staker.pubkey(), *vote_address);
 
-        let transient_stake_account = rpc_client
-            .get_account_with_commitment(&transient_stake_address, rpc_client.commitment())?
-            .value;
+        let transient_stake_activation =
+            rpc_client.get_stake_activation(transient_stake_address, None);
 
-        if let Some(transient_stake_account) = transient_stake_account {
-            let transient_stake_activation = rpc_client
-                .get_stake_activation(transient_stake_address, None)
-                .map_err(|err| {
-                    format!(
-                        "Unable to get activation information for transient stake account: {}: {}",
-                        transient_stake_address, err
-                    )
-                })?;
-
+        if let Ok(transient_stake_activation) = transient_stake_activation {
             match transient_stake_activation.state {
                 StakeActivationState::Activating => {
                     let action = format!(
@@ -384,15 +399,16 @@ fn merge_transient_stake_accounts(
                     validator_stake_actions.insert(*identity, action);
                 }
                 StakeActivationState::Active => {
-                    let stake_account = rpc_client
-                        .get_account_with_commitment(&stake_address, rpc_client.commitment())?
-                        .value
-                        .unwrap_or_default();
+                    let stake_activation = rpc_client
+                        .get_stake_activation(stake_address, None)
+                        .map_err(|err| {
+                            format!(
+                                "Unable to get activation information for stake account: {}: {}",
+                                stake_address, err
+                            )
+                        })?;
 
-                    if stake_accounts_have_same_credits_observed(
-                        &stake_account,
-                        &transient_stake_account,
-                    )? {
+                    if stake_activation.state == StakeActivationState::Active {
                         transactions.push(Transaction::new_with_payer(
                             &stake_instruction::merge(
                                 &stake_address,
@@ -404,7 +420,8 @@ fn merge_transient_stake_accounts(
                         debug!("Merging active transient stake for {}", identity);
                     } else {
                         let action = format!(
-                            "stake account busy due to credits observed mismatch with transient stake account {}",
+                            "stake account {} busy because not active, while transient account {} is active",
+                            stake_address,
                             transient_stake_address
                         );
                         warn!("Busy validator {}: {}", *identity, action);
@@ -426,9 +443,15 @@ fn merge_transient_stake_accounts(
         }
     }
 
-    if !send_and_confirm_transactions(rpc_client, false, transactions, authorized_staker)?
-        .failed
-        .is_empty()
+    if send_and_confirm_transactions_with_spinner(
+        rpc_client,
+        websocket_url,
+        false,
+        transactions,
+        authorized_staker,
+    )?
+        .iter()
+        .any(|err| err.is_some())
     {
         Err("Failed to merge transient stake".into())
     } else {
@@ -436,41 +459,9 @@ fn merge_transient_stake_accounts(
     }
 }
 
-fn stake_accounts_have_same_credits_observed(
-    stake_account1: &Account,
-    stake_account2: &Account,
-) -> Result<bool, Box<dyn error::Error>> {
-    use solana_sdk::stake::state::Stake;
-
-    let stake_state1 = bincode::deserialize(stake_account1.data.as_slice())
-        .map_err(|err| format!("Invalid stake account 1: {}", err))?;
-    let stake_state2 = bincode::deserialize(stake_account2.data.as_slice())
-        .map_err(|err| format!("Invalid stake account 2: {}", err))?;
-
-    if let (
-        StakeState::Stake(
-            _,
-            Stake {
-                delegation: _,
-                credits_observed: credits_observed1,
-            },
-        ),
-        StakeState::Stake(
-            _,
-            Stake {
-                delegation: _,
-                credits_observed: credits_observed2,
-            },
-        ),
-    ) = (stake_state1, stake_state2)
-    {
-        return Ok(credits_observed1 == credits_observed2);
-    }
-    Ok(false)
-}
-
 fn create_validator_stake_accounts(
-    rpc_client: &RpcClient,
+    rpc_client: Arc<RpcClient>,
+    websocket_url: &str,
     authorized_staker: &Keypair,
     desired_validator_stake: &[ValidatorStake],
     reserve_stake_address: Pubkey,
@@ -478,16 +469,16 @@ fn create_validator_stake_accounts(
     validator_stake_actions: &mut ValidatorStakeActions,
 ) -> Result<(), Box<dyn error::Error>> {
     let mut reserve_stake_balance = get_available_reserve_stake_balance(
-        rpc_client,
+        &rpc_client,
         reserve_stake_address,
         min_reserve_stake_balance,
     )
-    .map_err(|err| {
-        format!(
-            "Unable to get reserve stake account balance: {}: {}",
-            reserve_stake_address, err
-        )
-    })?;
+        .map_err(|err| {
+            format!(
+                "Unable to get reserve stake account balance: {}: {}",
+                reserve_stake_address, err
+            )
+        })?;
     info!(
         "Reserve stake available balance: {}",
         Sol(reserve_stake_balance)
@@ -595,9 +586,15 @@ fn create_validator_stake_accounts(
         }
     }
 
-    if !send_and_confirm_transactions(rpc_client, false, transactions, authorized_staker)?
-        .failed
-        .is_empty()
+    if send_and_confirm_transactions_with_spinner(
+        rpc_client,
+        websocket_url,
+        false,
+        transactions,
+        authorized_staker,
+    )?
+        .iter()
+        .any(|err| err.is_some())
     {
         Err("Failed to create validator stake accounts".into())
     } else {
@@ -607,7 +604,8 @@ fn create_validator_stake_accounts(
 
 #[allow(clippy::too_many_arguments)]
 fn distribute_validator_stake<V>(
-    rpc_client: &RpcClient,
+    rpc_client: Arc<RpcClient>,
+    websocket_url: &str,
     dry_run: bool,
     authorized_staker: &Keypair,
     desired_validator_stake: V,
@@ -618,8 +616,8 @@ fn distribute_validator_stake<V>(
     validator_stake_actions: &mut ValidatorStakeActions,
     unfunded_validators: &mut HashSet<Pubkey>,
 ) -> Result<(), Box<dyn error::Error>>
-where
-    V: IntoIterator<Item = ValidatorStake>,
+    where
+        V: IntoIterator<Item = ValidatorStake>,
 {
     // Prioritize funding smaller stake accounts to maximize the number of accounts that will be
     // funded with the available reserve stake.  But validators with the priority flag jump the
@@ -699,7 +697,7 @@ where
         let transient_stake_address_seed = validator_transient_stake_address_seed(vote_address);
 
         #[allow(clippy::comparison_chain)]
-        let op_msg = if balance > desired_balance {
+            let op_msg = if balance > desired_balance {
             let amount_to_remove = balance - desired_balance;
             if amount_to_remove < MIN_STAKE_CHANGE_AMOUNT {
                 format!("not removing {} (amount too small)", Sol(amount_to_remove))
@@ -792,9 +790,15 @@ where
     let ok = if dry_run {
         true
     } else {
-        send_and_confirm_transactions(rpc_client, false, transactions, authorized_staker)?
-            .failed
-            .is_empty()
+        !send_and_confirm_transactions_with_spinner(
+            rpc_client,
+            websocket_url,
+            false,
+            transactions,
+            authorized_staker,
+        )?
+            .iter()
+            .any(|err| err.is_some())
     };
 
     if !ok {
@@ -836,7 +840,8 @@ mod test {
 
     fn uniform_stake_pool_apply(
         stake_pool: &mut StakePool,
-        rpc_client: &RpcClient,
+        rpc_client: Arc<RpcClient>,
+        websocket_url: &str,
         validators: &[ValidatorAddressPair],
         stake_state: ValidatorStakeState,
         expected_validator_stake_balance: u64,
@@ -853,20 +858,30 @@ mod test {
             .collect::<Vec<_>>();
 
         stake_pool
-            .apply(rpc_client, false, &desired_validator_stake)
+            .apply(
+                rpc_client.clone(),
+                websocket_url,
+                false,
+                &desired_validator_stake,
+            )
             .unwrap();
 
         assert_eq!(
-            num_stake_accounts(rpc_client, &stake_pool.authorized_staker),
+            num_stake_accounts(&rpc_client, &stake_pool.authorized_staker),
             1 + 2 * validators.len()
         );
-        let _epoch = wait_for_next_epoch(rpc_client).unwrap();
+        let _epoch = wait_for_next_epoch(&rpc_client).unwrap();
         stake_pool
-            .apply(rpc_client, false, &desired_validator_stake)
+            .apply(
+                rpc_client.clone(),
+                websocket_url,
+                false,
+                &desired_validator_stake,
+            )
             .unwrap();
 
         assert_eq!(
-            num_stake_accounts(rpc_client, &stake_pool.authorized_staker),
+            num_stake_accounts(&rpc_client, &stake_pool.authorized_staker),
             1 + validators.len()
         );
         assert_eq!(
@@ -878,7 +893,7 @@ mod test {
         for validator in validators {
             assert_eq!(
                 validator_stake_balance(
-                    rpc_client,
+                    &rpc_client,
                     stake_pool.authorized_staker.pubkey(),
                     validator
                 ),
@@ -899,7 +914,9 @@ mod test {
         ));
         let (test_validator, authorized_staker) = test_validator_genesis.start();
 
+        let websocket_url = &test_validator.rpc_pubsub_url();
         let (rpc_client, _recent_blockhash, _fee_calculator) = test_validator.rpc_client();
+        let rpc_client = Arc::new(rpc_client);
 
         let authorized_staker_address = authorized_staker.pubkey();
 
@@ -932,8 +949,8 @@ mod test {
             &authorized_staker.pubkey(),
             total_stake_amount_plus_min,
         )
-        .unwrap()
-        .pubkey();
+            .unwrap()
+            .pubkey();
 
         let assert_reserve_account_only = || {
             assert_eq!(
@@ -947,7 +964,7 @@ mod test {
                         reserve_stake_address,
                         min_reserve_stake_balance
                     )
-                    .unwrap(),
+                        .unwrap(),
                     total_stake_amount
                 );
 
@@ -967,14 +984,15 @@ mod test {
             reserve_stake_address,
             min_reserve_stake_balance,
         )
-        .unwrap();
+            .unwrap();
 
         // ===========================================================
         info!("Start with no stake in the validators");
         let epoch = rpc_client.get_epoch_info().unwrap().epoch;
         stake_pool
             .apply(
-                &rpc_client,
+                rpc_client.clone(),
+                websocket_url,
                 false,
                 &validators
                     .iter()
@@ -1020,7 +1038,8 @@ mod test {
         info!("All validators to baseline stake level");
         uniform_stake_pool_apply(
             &mut stake_pool,
-            &rpc_client,
+            rpc_client.clone(),
+            websocket_url,
             &validators,
             ValidatorStakeState::Baseline,
             baseline_stake_amount,
@@ -1031,7 +1050,8 @@ mod test {
         info!("All the validators to bonus stake level");
         uniform_stake_pool_apply(
             &mut stake_pool,
-            &rpc_client,
+            rpc_client.clone(),
+            websocket_url,
             &validators,
             ValidatorStakeState::Bonus,
             total_stake_amount / validators.len() as u64,
@@ -1062,11 +1082,21 @@ mod test {
         ];
 
         stake_pool
-            .apply(&rpc_client, false, &desired_validator_stake)
+            .apply(
+                rpc_client.clone(),
+                websocket_url,
+                false,
+                &desired_validator_stake,
+            )
             .unwrap();
         let _epoch = wait_for_next_epoch(&rpc_client).unwrap();
         stake_pool
-            .apply(&rpc_client, false, &desired_validator_stake)
+            .apply(
+                rpc_client.clone(),
+                websocket_url,
+                false,
+                &desired_validator_stake,
+            )
             .unwrap();
 
         // after the first epoch, validators 0 and 1 are at their target levels but validator 2
@@ -1094,7 +1124,12 @@ mod test {
 
         let _epoch = wait_for_next_epoch(&rpc_client).unwrap();
         stake_pool
-            .apply(&rpc_client, false, &desired_validator_stake)
+            .apply(
+                rpc_client.clone(),
+                websocket_url,
+                false,
+                &desired_validator_stake,
+            )
             .unwrap();
 
         assert_eq!(
@@ -1122,10 +1157,14 @@ mod test {
         info!("remove all validators");
 
         // deactivate all validator stake
-        stake_pool.apply(&rpc_client, false, &[]).unwrap();
+        stake_pool
+            .apply(rpc_client.clone(), websocket_url, false, &[])
+            .unwrap();
         let _epoch = wait_for_next_epoch(&rpc_client).unwrap();
         // merge deactivated validator stake back into the reserve
-        stake_pool.apply(&rpc_client, false, &[]).unwrap();
+        stake_pool
+            .apply(rpc_client.clone(), websocket_url, false, &[])
+            .unwrap();
         // all stake has returned to the reserve account
         assert_reserve_account_only();
     }

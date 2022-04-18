@@ -1,20 +1,19 @@
-use std::error::Error;
-use std::io::ErrorKind;
-use std::ops::Deref;
-use borsh::schema::Definition::Tuple;
 use solana_client::rpc_response::RpcInflationReward;
 use solana_sdk::epoch_schedule::EpochSchedule;
 use rayon::prelude::*;
 use std::sync::{Arc, Mutex};
 use {
+    indicatif::{ProgressBar, ProgressStyle},
     log::*,
     solana_client::{
+        pubsub_client::PubsubClientError,
         rpc_client::RpcClient,
         rpc_config::RpcSimulateTransactionConfig,
-        rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig},
+        rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcSendTransactionConfig},
         rpc_filter,
         rpc_request::MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS,
-        rpc_response::{RpcVoteAccountInfo, RpcVoteAccountStatus},
+        rpc_response::{Fees, RpcVoteAccountInfo, RpcVoteAccountStatus},
+        tpu_client::{TpuClient, TpuClientConfig, TpuSenderError},
     },
     serde::{Deserialize, Serialize},
     solana_sdk::{
@@ -23,13 +22,14 @@ use {
         pubkey::Pubkey,
         signature::{Keypair, Signature, Signer},
         stake,
-        transaction::Transaction,
+        transaction::{Transaction, TransactionError},
         account::from_account,
         account_utils::StateMut,
         clock::Clock,
         stake::state::StakeState,
         commitment_config::CommitmentConfig,
         stake_history::StakeHistory,
+        stake::state::StakeActivationStatus,
         sysvar,
     },
     std::{
@@ -37,153 +37,210 @@ use {
         error,
         str::FromStr,
         thread::sleep,
-        time::Duration,
+        time::{Duration, Instant}
     },
 };
-use crate::data_center_info::get;
-use crate::sysvar::stake_history;
+
+fn new_spinner_progress_bar() -> ProgressBar {
+    let progress_bar = ProgressBar::new(42);
+    progress_bar
+        .set_style(ProgressStyle::default_spinner().template("{spinner:.green} {wide_msg}"));
+    progress_bar.enable_steady_tick(100);
+    progress_bar
+}
+
+fn new_tpu_client_with_retry(
+    rpc_client: &Arc<RpcClient>,
+    websocket_url: &str,
+) -> Result<TpuClient, TpuSenderError> {
+    let mut retries = 5;
+    let sleep_seconds = 5;
+    while retries > 0 {
+        match TpuClient::new(
+            rpc_client.clone(),
+            websocket_url,
+            TpuClientConfig::default(),
+        ) {
+            // only retry on connection error
+            Err(TpuSenderError::PubsubError(PubsubClientError::ConnectionError(_))) => {
+                warn!(
+                    "Error creating Tpu Client, retrying in {}s, {} retries remaining",
+                    sleep_seconds, retries
+                );
+                retries -= 1;
+                sleep(Duration::from_secs(sleep_seconds));
+            }
+            // everything else, Ok or Err, can pass through
+            result => return result,
+        }
+    }
+    TpuClient::new(
+        rpc_client.clone(),
+        websocket_url,
+        TpuClientConfig::default(),
+    )
+}
 
 pub struct SendAndConfirmTransactionResult {
     pub succeeded: HashSet<Signature>,
     pub failed: HashSet<Signature>,
 }
 
-pub fn send_and_confirm_transactions(
-    rpc_client: &RpcClient,
+pub fn send_and_confirm_transactions_with_spinner(
+    rpc_client: Arc<RpcClient>,
+    websocket_url: &str,
     dry_run: bool,
     transactions: Vec<Transaction>,
-    authorized_staker: &Keypair,
-) -> Result<SendAndConfirmTransactionResult, Box<dyn error::Error>> {
-    let authorized_staker_balance = rpc_client.get_balance(&authorized_staker.pubkey())?;
-    info!(
-        "Authorized staker balance: {} SOL",
-        lamports_to_sol(authorized_staker_balance)
-    );
-
-    let (mut blockhash, fee_calculator) = rpc_client.get_recent_blockhash()?;
-    info!("{} transactions to send", transactions.len());
-
-    let required_fee = transactions.iter().fold(0, |fee, transaction| {
-        fee + fee_calculator.calculate_fee(&transaction.message)
-    });
-    info!("Required fee: {} SOL", lamports_to_sol(required_fee));
-    if required_fee > authorized_staker_balance {
-        return Err("Authorized staker has insufficient funds".into());
+    signer: &Keypair,
+) -> Result<Vec<Option<TransactionError>>, Box<dyn error::Error>> {
+    if transactions.is_empty() {
+        return Ok(vec![]);
     }
+    let progress_bar = new_spinner_progress_bar();
+    let mut expired_blockhash_retries = 5;
+    let send_transaction_interval = Duration::from_millis(10); /* Send at ~100 TPS */
+    let transaction_resend_interval = Duration::from_secs(4); /* Retry batch send after 4 seconds */
 
-    let mut pending_transactions = vec![];
-    for mut transaction in transactions {
-        if dry_run {
-            rpc_client.simulate_transaction_with_config(
-                &transaction,
-                RpcSimulateTransactionConfig {
-                    sig_verify: false,
-                    ..RpcSimulateTransactionConfig::default()
-                },
-            )?;
-        } else {
-            transaction.sign(&[authorized_staker], blockhash);
-            let _ = rpc_client.send_transaction(&transaction).map_err(|err| {
-                warn!("Failed to send transaction: {:?}", err);
-            });
-        }
-        pending_transactions.push(transaction);
-    }
+    progress_bar.set_message("Connecting...");
+    let tpu_client = new_tpu_client_with_retry(&rpc_client, websocket_url)?;
 
-    let mut succeeded_transactions = HashSet::new();
-    let mut failed_transactions = HashSet::new();
-    let mut max_expired_blockhashes = 5usize;
-    loop {
-        if pending_transactions.is_empty() {
-            break;
-        }
+    let mut transactions = transactions.into_iter().enumerate().collect::<Vec<_>>();
+    let num_transactions = transactions.len() as f64;
+    let mut transaction_errors = vec![None; transactions.len()];
+    let set_message = |confirmed_transactions,
+                       block_height: Option<u64>,
+                       last_valid_block_height: u64,
+                       status: &str| {
+        progress_bar.set_message(format!(
+            "{:>5.1}% | {:<40}{}",
+            confirmed_transactions as f64 * 100. / num_transactions,
+            status,
+            match block_height {
+                Some(block_height) => format!(
+                    " [block height {}; re-sign in {} blocks]",
+                    block_height,
+                    last_valid_block_height.saturating_sub(block_height),
+                ),
+                None => String::new(),
+            },
+        ));
+    };
 
-        let blockhash_expired = rpc_client
-            .get_fee_calculator_for_blockhash(&blockhash)?
-            .is_none();
-        if blockhash_expired && !dry_run {
-            max_expired_blockhashes = max_expired_blockhashes.saturating_sub(1);
-            warn!(
-                "Blockhash {} expired with {} pending transactions ({} retries remaining)",
-                blockhash,
-                pending_transactions.len(),
-                max_expired_blockhashes,
-            );
+    let mut confirmed_transactions = 0;
+    let mut block_height = rpc_client.get_block_height()?;
+    while expired_blockhash_retries > 0 {
+        let Fees {
+            blockhash,
+            fee_calculator: _,
+            last_valid_block_height,
+        } = rpc_client.get_fees()?;
 
-            if max_expired_blockhashes == 0 {
-                return Err("Too many expired blockhashes".into());
-            }
-
-            blockhash = rpc_client.get_recent_blockhash()?.0;
-
-            warn!(
-                "Resending pending transactions with blockhash: {}",
-                blockhash
-            );
-            for transaction in pending_transactions.iter_mut() {
-                assert!(!dry_run);
-                transaction.sign(&[authorized_staker], blockhash);
-                let _ = rpc_client.send_transaction(transaction).map_err(|err| {
-                    warn!("Failed to resend transaction: {:?}", err);
-                });
-            }
+        let mut pending_transactions = HashMap::new();
+        for (i, mut transaction) in transactions {
+            transaction.try_sign(&[signer], blockhash)?;
+            pending_transactions.insert(transaction.signatures[0], (i, transaction));
         }
 
-        let mut statuses = vec![];
-        for pending_signatures_chunk in pending_transactions
-            .iter()
-            .map(|transaction| transaction.signatures[0])
-            .collect::<Vec<_>>()
-            .chunks(MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS - 1)
-        {
-            trace!(
-                "checking {} pending transactions",
-                pending_signatures_chunk.len()
-            );
-            statuses.extend(
-                rpc_client
-                    .get_signature_statuses(pending_signatures_chunk)?
-                    .value
-                    .into_iter(),
-            )
-        }
-        assert_eq!(statuses.len(), pending_transactions.len());
+        let mut last_resend = Instant::now() - transaction_resend_interval;
+        while block_height <= last_valid_block_height {
+            let num_transactions = pending_transactions.len();
 
-        let mut still_pending_transactions = vec![];
-        for (transaction, status) in pending_transactions.into_iter().zip(statuses.into_iter()) {
-            let signature = transaction.signatures[0];
-            trace!("{}: status={:?}", signature, status);
-            let completed = if dry_run {
-                Some(true)
-            } else if let Some(status) = &status {
-                if status.satisfies_commitment(rpc_client.commitment()) {
-                    Some(status.err.is_none())
-                } else {
-                    None
+            // Periodically re-send all pending transactions
+            if Instant::now().duration_since(last_resend) > transaction_resend_interval {
+                for (index, (_i, transaction)) in pending_transactions.values().enumerate() {
+                    let method = if dry_run {
+                        "DRY RUN"
+                    } else if tpu_client.send_transaction(transaction) {
+                        "TPU"
+                    } else {
+                        let _ = rpc_client.send_transaction_with_config(
+                            transaction,
+                            RpcSendTransactionConfig {
+                                skip_preflight: true,
+                                ..RpcSendTransactionConfig::default()
+                            },
+                        );
+                        "RPC"
+                    };
+                    set_message(
+                        confirmed_transactions,
+                        None, //block_height,
+                        last_valid_block_height,
+                        &format!(
+                            "Sending {}/{} transactions (via {})",
+                            index + 1,
+                            num_transactions,
+                            method
+                        ),
+                    );
+                    sleep(send_transaction_interval);
                 }
-            } else {
-                None
-            };
+                last_resend = Instant::now();
+            }
 
-            if let Some(success) = completed {
-                info!("{}: completed. success={}", signature, success);
-                if success {
-                    succeeded_transactions.insert(signature);
-                } else {
-                    failed_transactions.insert(signature);
+            // Wait for the next block before checking for transaction statuses
+            set_message(
+                confirmed_transactions,
+                Some(block_height),
+                last_valid_block_height,
+                &format!("Waiting for next block, {} pending...", num_transactions),
+            );
+
+            let mut new_block_height = block_height;
+            while block_height == new_block_height {
+                sleep(Duration::from_millis(500));
+                new_block_height = rpc_client.get_block_height()?;
+            }
+            block_height = new_block_height;
+            if dry_run {
+                return Ok(transaction_errors);
+            }
+
+            // Collect statuses for the transactions, drop those that are confirmed
+            let pending_signatures = pending_transactions.keys().cloned().collect::<Vec<_>>();
+            for pending_signatures_chunk in
+            pending_signatures.chunks(MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS)
+            {
+                if let Ok(result) = rpc_client.get_signature_statuses(pending_signatures_chunk) {
+                    let statuses = result.value;
+                    for (signature, status) in
+                    pending_signatures_chunk.iter().zip(statuses.into_iter())
+                    {
+                        if let Some(status) = status {
+                            if status.satisfies_commitment(rpc_client.commitment()) {
+                                if let Some((i, _)) = pending_transactions.remove(signature) {
+                                    confirmed_transactions += 1;
+                                    if status.err.is_some() {
+                                        progress_bar
+                                            .println(format!("Failed transaction: {:?}", status));
+                                    }
+                                    transaction_errors[i] = status.err;
+                                }
+                            }
+                        }
+                    }
                 }
-            } else {
-                still_pending_transactions.push(transaction);
+                set_message(
+                    confirmed_transactions,
+                    Some(block_height),
+                    last_valid_block_height,
+                    "Checking transaction status...",
+                );
+            }
+
+            if pending_transactions.is_empty() {
+                return Ok(transaction_errors);
             }
         }
-        pending_transactions = still_pending_transactions;
-        sleep(Duration::from_millis(500));
-    }
 
-    Ok(SendAndConfirmTransactionResult {
-        succeeded: succeeded_transactions,
-        failed: failed_transactions,
-    })
+        transactions = pending_transactions.into_iter().map(|(_k, v)| v).collect();
+        progress_bar.println(format!(
+            "Blockhash expired. {} retries remaining",
+            expired_blockhash_retries
+        ));
+        expired_blockhash_retries -= 1;
+    }
+    Err("Max retries exceeded".into())
 }
 
 #[derive(Default, Copy, Clone, Deserialize, Serialize)]
@@ -321,7 +378,7 @@ pub fn get_inflation_rewards(
     let epoch_schedule = rpc_client.get_epoch_schedule()?;
     // Calculate apy
     info!("Calculate APY");
-    let mut epoch_cache = Arc::new(Mutex::new(HashMap::<u64, (i64, i64)>::new()));
+    let epoch_cache = Arc::new(Mutex::new(HashMap::<u64, (i64, i64)>::new()));
     let inflation_reward_infos: Vec<InflationRewardInfo> = rewards.into_par_iter().flat_map(|r| {
         let (address, inflation_reward) = r;
         let epoch_time = match epoch_cache.lock().unwrap().get(&inflation_reward.effective_slot).cloned() {
@@ -425,16 +482,8 @@ pub fn get_stake_accounts(
     rpc_client: &RpcClient,
 ) -> Result<HashMap<Pubkey, Vec<StakeAccountInfo>>, Box<dyn error::Error>> {
     let mut all_stake_addresses = HashMap::<Pubkey, Vec<StakeAccountInfo>>::new();
-    let all_stake_accounts = rpc_client.get_program_accounts_with_config(
-        &stake::program::id(),
-        RpcProgramAccountsConfig {
-            account_config: RpcAccountInfoConfig {
-                encoding: Some(solana_account_decoder::UiAccountEncoding::Base64),
-                commitment: Some(rpc_client.commitment()),
-                ..RpcAccountInfoConfig::default()
-            },
-            ..RpcProgramAccountsConfig::default()
-        },
+    let all_stake_accounts = rpc_client.get_program_accounts(
+        &stake::program::id()
     )?;
     let stake_history_account = rpc_client
         .get_account_with_commitment(&sysvar::stake_history::id(), CommitmentConfig::finalized())?
@@ -450,9 +499,9 @@ pub fn get_stake_accounts(
         if let Ok(stake_state) = stake_account.state() {
             match stake_state {
                 StakeState::Stake(_, stake) => {
-                    let (effective, activating, deactivating) = stake
+                    let StakeActivationStatus { effective, activating, deactivating } = stake
                         .delegation
-                        .stake_activating_and_deactivating(current_epoch, Some(&stake_history), true);
+                        .stake_activating_and_deactivating(current_epoch, Some(&stake_history));
                     let stake_account_info = StakeAccountInfo {
                         stake_account: stake_pubkey,
                         voter_pubkey: stake.delegation.voter_pubkey,
