@@ -14,12 +14,12 @@ path = "src/main.rs"
 
 [dependencies]
 clap = "2.33.3"
-solana-account-decoder = "1.9.16"
-solana-clap-utils = "1.9.16"
-solana-cli-config = "1.9.16"
-solana-client = "1.9.16"
+solana-account-decoder = "=1.9.13"
+solana-clap-utils = "=1.9.13"
+solana-cli-config = "=1.9.13"
+solana-client = "=1.9.13"
 solana-foundation-delegation-program-registry = { version = "1.0.0", path = "../program" }
-solana-logger = "1.9.16"
-solana-remote-wallet = "1.9.16"
-solana-sdk = "1.9.16"
+solana-logger = "=1.9.13"
+solana-remote-wallet = "=1.9.13"
+solana-sdk = "=1.9.13"
 tokio = { version = "1", features = ["full"] }
