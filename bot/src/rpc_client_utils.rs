@@ -1,7 +1,6 @@
 use solana_client::rpc_response::RpcInflationReward;
 use solana_sdk::epoch_schedule::EpochSchedule;
 use rayon::prelude::*;
-use std::sync::{Arc, Mutex};
 use {
     indicatif::{ProgressBar, ProgressStyle},
     log::*,
@@ -37,7 +36,9 @@ use {
         error,
         str::FromStr,
         thread::sleep,
-        time::{Duration, Instant}
+        time::{Duration, Instant},
+        sync::{Arc, Mutex},
+        io::{Error, ErrorKind}
     },
 };
 
@@ -296,6 +297,10 @@ pub fn get_epoch_boundary_timestamps(
     let epoch_end_time = rpc_client.get_block_time(reward.effective_slot)?;
     let mut epoch_start_slot = epoch_schedule.get_first_slot_in_epoch(reward.epoch);
     let performance_samples = rpc_client.get_recent_performance_samples(Some(360))?;
+    if performance_samples.len() == 0 {
+        return Err(Box::new(Error::new(ErrorKind::InvalidData,
+                                       "Sample performance samples should not be empty")));
+    }
     let average_slot_time =
         performance_samples.iter()
             .map(|s| s.sample_period_secs as f32 / s.num_slots as f32 ).sum::<f32>() as f32 /
