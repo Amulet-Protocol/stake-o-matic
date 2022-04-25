@@ -295,19 +295,20 @@ pub fn get_epoch_boundary_timestamps(
     epoch_schedule: &EpochSchedule,
 ) -> Result<(i64, i64), Box<dyn std::error::Error>> {
     let epoch_end_time = rpc_client.get_block_time(reward.effective_slot)?;
-    let mut epoch_start_slot = epoch_schedule.get_first_slot_in_epoch(reward.epoch);
+    let epoch_first_slot = epoch_schedule.get_first_slot_in_epoch(reward.epoch);
+    let mut epoch_start_slot = epoch_first_slot;
     let performance_samples = rpc_client.get_recent_performance_samples(Some(360))?;
     if performance_samples.len() == 0 {
         return Err(Box::new(Error::new(ErrorKind::InvalidData,
                                        "Sample performance samples should not be empty")));
     }
-    let average_slot_time =
-        performance_samples.iter()
-            .map(|s| s.sample_period_secs as f32 / s.num_slots as f32 ).sum::<f32>() as f32 /
-                performance_samples.len() as f32;
+    let slot_time_sum = performance_samples.iter()
+        .map(|s| s.sample_period_secs as f32 / s.num_slots as f32 ).sum::<f32>();
+    info!("slot_time_sum {}", slot_time_sum);
+    let average_slot_time = slot_time_sum as f32 / performance_samples.len() as f32;
     info!("average_slot_time {}", average_slot_time);
     let epoch_start_time = loop {
-        if epoch_start_slot >= reward.epoch + 10 {
+        if epoch_start_slot >= epoch_first_slot + 10 {
             let diff_slot = reward.effective_slot - epoch_start_slot;
             let diff_slot_duration = diff_slot as f64  * average_slot_time as f64;
             let start_time = epoch_end_time - diff_slot_duration as i64;
