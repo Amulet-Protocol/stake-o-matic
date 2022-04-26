@@ -1,4 +1,4 @@
-use solana_client::rpc_response::RpcInflationReward;
+use solana_client::rpc_response::{RpcInflationReward, RpcPerfSample};
 use solana_sdk::epoch_schedule::EpochSchedule;
 use rayon::prelude::*;
 use {
@@ -298,6 +298,8 @@ pub fn get_epoch_boundary_timestamps(
     let epoch_first_slot = epoch_schedule.get_first_slot_in_epoch(reward.epoch);
     let mut epoch_start_slot = epoch_first_slot;
     let performance_samples = rpc_client.get_recent_performance_samples(Some(360))?;
+    let performance_samples: Vec<RpcPerfSample> = performance_samples.into_iter()
+        .filter(|s| s.num_slots > 0).collect();
     if performance_samples.len() == 0 {
         return Err(Box::new(Error::new(ErrorKind::InvalidData,
                                        "Sample performance samples should not be empty")));
