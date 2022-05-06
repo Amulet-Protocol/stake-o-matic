@@ -1000,8 +1000,12 @@ fn classify_poor_voters(
         .iter()
         .map(|vai|(vai.epoch_credits as f64 * (100.0 - vai.commission as f64) / 100.0) as u64)
         .filter(|&c| c > 300000 as u64).collect();
-    let avg_adj_credits = filtered_accounts.iter().sum::<u64>()
-        / filtered_accounts.len() as u64;
+    let avg_adj_credits = if filtered_accounts.len() == 0 {
+        0 as u64
+    } else {
+        filtered_accounts.iter().sum::<u64>()
+            / filtered_accounts.len() as u64
+    };
 
     let min_epoch_credits =
         avg_epoch_credits * (100 - config.min_epoch_credit_percentage_of_average as u64) / 100;
@@ -1422,14 +1426,7 @@ fn classify(
         ));
     }
 
-    let validator_classifications = if
-        config.cluster != Cluster::Devnet && (too_many_poor_voters
-        || too_many_old_validators
-        || too_many_poor_block_producers)
-    {
-        notes.push("Stake adjustments skipped this epoch".to_string());
-        None
-    } else {
+    let validator_classifications = {
         let mut validator_classifications = HashMap::new();
         let mut total_skipped: u32 = 0;
 
@@ -1662,6 +1659,11 @@ fn classify(
 
             let inflation_reward = inflation_rewards.get(&vote_address).cloned();
             let adj_credits = (epoch_credits as f64 * (100.0 - commission as f64) / 100.0) as u64;
+            let average_position = if avg_adj_credits == 0 {
+                0.0
+            } else {
+                adj_credits as f64 / avg_adj_credits as f64 * 50.0
+            };
             validator_classifications.insert(
                 identity,
                 ValidatorClassification {
@@ -1671,7 +1673,7 @@ fn classify(
                     score_data: Some(ScoreData {
                         epoch_credits,
                         adj_credits,
-                        average_position: adj_credits as f64 / avg_adj_credits as f64 * 50.0,
+                        average_position,
                         score_discounts,
                         commission,
                         active_stake,
