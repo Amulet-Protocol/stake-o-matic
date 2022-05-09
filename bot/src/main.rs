@@ -908,6 +908,8 @@ type ClassifyResult = (
     usize,
     // too_many_poor_block_producers
     bool,
+    // poor_block_producer_percentage
+    usize
 );
 
 fn classify_producers(
@@ -983,6 +985,7 @@ fn classify_producers(
         reason_msg,
         cluster_average_skip_rate,
         too_many_poor_block_producers,
+        poor_block_producer_percentage
     ))
 }
 
@@ -1339,6 +1342,7 @@ fn classify(
         block_producer_classification_reason,
         cluster_average_skip_rate,
         too_many_poor_block_producers,
+        poor_block_producer_percentage
     ) = classify_block_producers(rpc_client, config, last_epoch)?;
 
     let not_in_leader_schedule: ValidatorList = validator_list
@@ -1713,6 +1717,16 @@ fn classify(
         data_center_info: data_centers.info,
         validator_classifications,
         notes,
+        cluster_state: ClusterState {
+            min_epoch_credits,
+            avg_epoch_credits,
+            poor_voter_percentage,
+            too_many_poor_voters,
+            cluster_average_skip_rate,
+            poor_block_producer_percentage,
+            too_many_poor_block_producers,
+            too_many_old_validators
+        }
     })
 }
 
@@ -1997,6 +2011,25 @@ fn generate_markdown(epoch: Epoch, config: Config, mut db_client: postgres::Clie
                 }
                 Err(e) => info!("Error copying in query: {}", e.to_string())
             }
+
+
+            db_client.execute(
+                "INSERT INTO validators_states (epoch, min_epoch_credits, avg_epoch_credits,
+                    poor_voter_percentage, too_many_poor_voters, cluster_average_skip_rate,
+                    poor_block_producer_percentage, too_many_poor_block_producers, too_many_old_validators,
+                    notes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                &[
+                    &(*epoch as i32),
+                    &(epoch_classification.cluster_state.min_epoch_credits as i32),
+                    &(epoch_classification.cluster_state.avg_epoch_credits as i32),
+                    &(epoch_classification.cluster_state.poor_voter_percentage as i32),
+                    &epoch_classification.cluster_state.too_many_poor_voters,
+                    &(epoch_classification.cluster_state.cluster_average_skip_rate as i32),
+                    &(epoch_classification.cluster_state.poor_block_producer_percentage as i32),
+                    &(epoch_classification.cluster_state.too_many_poor_block_producers),
+                    &epoch_classification.cluster_state.too_many_old_validators,
+                    &epoch_classification.notes.join("\n")],
+            )?;
         }
     }
 

@@ -174,6 +174,18 @@ pub type ValidatorClassificationByIdentity =
     HashMap<solana_sdk::pubkey::Pubkey, ValidatorClassification>;
 
 #[derive(Default, Deserialize, Serialize, Clone)]
+pub struct ClusterState {
+    pub min_epoch_credits: u64,
+    pub avg_epoch_credits: u64,
+    pub poor_voter_percentage: usize,
+    pub too_many_poor_voters: bool,
+    pub cluster_average_skip_rate: usize,
+    pub poor_block_producer_percentage: usize,
+    pub too_many_poor_block_producers: bool,
+    pub too_many_old_validators: bool
+}
+
+#[derive(Default, Deserialize, Serialize, Clone)]
 pub struct EpochClassificationV1 {
     // Data Center observations for this epoch
     pub data_center_info: Vec<DataCenterInfo>,
@@ -183,6 +195,8 @@ pub struct EpochClassificationV1 {
 
     // Informational notes regarding this epoch
     pub notes: Vec<String>,
+
+    pub cluster_state: ClusterState
 }
 
 #[derive(Deserialize, Serialize, Clone)]
