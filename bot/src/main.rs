@@ -1807,11 +1807,11 @@ fn fetch_store_validators(config: Config, rpc_client: RpcClient, mut db_client: 
 
     info!("Data directory: {}", config.cluster_db_path().display());
 
-    let previous_epoch_classification =
-        EpochClassification::load_previous(epoch, &config.cluster_db_path())?
-            .map(|p| p.1)
-            .unwrap_or_default()
-            .into_current();
+    // let previous_epoch_classification =
+    //     EpochClassification::load_previous(epoch, &config.cluster_db_path())?
+    //         .map(|p| p.1)
+    //         .unwrap_or_default()
+    //         .into_current();
 
     let (mut epoch_classification, first_time, post_notifications) =
         (
@@ -1821,9 +1821,7 @@ fn fetch_store_validators(config: Config, rpc_client: RpcClient, mut db_client: 
                 epoch,
                 &validator_list,
                 &identity_to_participant,
-                previous_epoch_classification
-                    .validator_classifications
-                    .as_ref(),
+                None,
             )?,
             true,
             false,
@@ -1833,9 +1831,7 @@ fn fetch_store_validators(config: Config, rpc_client: RpcClient, mut db_client: 
 
     if let Some(ref mut validator_classifications) = epoch_classification.validator_classifications
     {
-        let previous_validator_classifications = previous_epoch_classification
-            .validator_classifications
-            .unwrap_or_default();
+        let previous_validator_classifications = ValidatorClassificationByIdentity::new();
 
         let mut validator_stake_change_notes = vec![];
         let mut validator_notes = vec![];
