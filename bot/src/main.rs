@@ -1964,10 +1964,20 @@ fn generate_markdown(epoch: Epoch, config: Config, mut db_client: postgres::Clie
                     .epoch_credits
                     .cmp(&a.1.score_data.as_ref().unwrap().epoch_credits)
             });
+            // Check if inflation rewards is missing due to problem in retrieving data from archive node.
+            let missing_reward_size = validator_classifications.iter()
+                .map(|c| c.1)
+                .filter(|classifications|
+                    classifications.score_data.as_ref().map(|d| d.inflation_reward).flatten().is_none())
+                .collect::<Vec<&ValidatorClassification>>().len();
+            let missing_reward_threshold = (validator_classifications.len() as f64 * 0.98) as usize;
+            let is_reward_missing = missing_reward_size > missing_reward_threshold;
+            info!("missing_reward_size {}", missing_reward_size);
+            info!("missing_reward_threshold {} is_reward_missing {}", missing_reward_threshold, is_reward_missing);
             for (identity, classification) in validator_classifications {
                 //epoch,keybase_id,name,identity,vote_address,score,average_position,commission,active_stake,epoch_credits,data_center_concentration,can_halt_the_network_group,stake_state,stake_state_reason,www_url,inflation_reward,inflation_post_balance,apy,software_version,description
                 if let Some(score_data) = &classification.score_data {
-                    let score = score_data.score(&config);
+                    let score = score_data.score(&config, is_reward_missing);
                     let csv_line = format!(
                         r#"{},"{}","{}","{}","{}",{},{},{},{},{},{:.4},{},"{:?}","{}","{}",{},{},{},{},"{}","{}""#,
                         epoch,

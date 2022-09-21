@@ -86,14 +86,14 @@ pub struct ValidatorClassification {
 }
 
 impl ScoreData {
-    pub fn score(&self, config: &Config) -> u64 {
+    pub fn score(&self, config: &Config, is_reward_missing: bool) -> u64 {
         if self.score_discounts.can_halt_the_network_group
             || self.active_stake < config.score_min_stake
             || self.average_position < config.min_avg_position
             // if config.min_avg_position=100 => everybody passes
             // if config.min_avg_position=50 => only validators above avg pass
             || self.commission > config.score_max_commission
-            || self.inflation_reward.map(|i| i.apy).is_none()
+            || (!is_reward_missing && self.inflation_reward.map(|i| i.apy).is_none())
         {
             0
         } else {
