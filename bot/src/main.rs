@@ -1742,9 +1742,16 @@ fn fetch_store_validators(config: Config, rpc_client: RpcClient, mut db_client: 
     let prepare_stmt = db_client.prepare_typed(query, &[Type::INT8])
         .expect("failed to create prepared statement");
 
-    let result = db_client.query(&prepare_stmt, &[&(epoch as i64)])
+    let epoch_result = db_client.query(&prepare_stmt, &[&(epoch as i64)])
         .expect("failed to query item");
-    if result.len() > 0 {
+    let query = "SELECT (SELECT count(*) from validators WHERE epoch=$1) - count(*) as diff from validators \
+        WHERE epoch = $1 AND apy = 0";
+    let prepare_stmt = db_client.prepare_typed(query, &[Type::INT8])
+        .expect("failed to create prepared statement");
+    let apy_result = db_client.query(&prepare_stmt, &[&(epoch as i64)])
+        .expect("failed to query item");
+    let diff: i64 = apy_result[0].get("diff");
+    if epoch_result.len() > 0 && diff > 0 {
         info!("Classification for epoch {} already exists", epoch);
         return Ok(());
     }
@@ -2006,8 +2013,13 @@ fn generate_markdown(epoch: Epoch, config: Config, mut db_client: postgres::Clie
                 }
             }
 
-            let query = "COPY validators FROM STDIN DELIMITER ',' CSV HEADER";
-            match db_client.copy_in(query) {
+            let mut transaction = db_client.transaction()?;
+            let query = "CREATE TEMP TABLE tmp_table ON COMMIT DROP
+            AS SELECT * FROM validators WITH NO DATA";
+            transaction.execute(query, &[])?;
+
+            let query = "COPY tmp_table FROM STDIN DELIMITER ',' CSV HEADER";
+            match transaction.copy_in(query) {
                 Ok(mut writer) => {
                     writer.write_all(&validator_detail_csv.join("\n").into_bytes())?;
                     match writer.finish() {
@@ -2018,12 +2030,19 @@ fn generate_markdown(epoch: Epoch, config: Config, mut db_client: postgres::Clie
                 Err(e) => info!("Error copying in query: {}", e.to_string())
             }
 
+            let query = "INSERT INTO validators
+            SELECT * FROM tmp_table
+            ON CONFLICT(epoch, vote_address) DO
+            UPDATE SET (inflation_reward, inflation_post_balance, apy) = (excluded.inflation_reward, excluded.inflation_post_balance, excluded.apy)";
+            transaction.execute(query, &[])?;
+            transaction.commit()?;
 
+            info!("insert into validators_states");
             db_client.execute(
                 "INSERT INTO validators_states (epoch, min_epoch_credits, avg_epoch_credits,
                     poor_voter_percentage, too_many_poor_voters, cluster_average_skip_rate,
                     poor_block_producer_percentage, too_many_poor_block_producers, too_many_old_validators,
-                    notes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                    notes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT(epoch) DO NOTHING",
                 &[
                     &(*epoch as i32),
                     &(epoch_classification.cluster_state.min_epoch_credits as i32),
