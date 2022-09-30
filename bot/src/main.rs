@@ -2033,7 +2033,7 @@ fn generate_markdown(epoch: Epoch, config: Config, mut db_client: postgres::Clie
             let query = "INSERT INTO validators
             SELECT * FROM tmp_table
             ON CONFLICT(epoch, vote_address) DO
-            UPDATE SET (inflation_reward, inflation_post_balance, apy) = (excluded.inflation_reward, excluded.inflation_post_balance, excluded.apy)";
+            UPDATE SET (inflation_reward, inflation_post_balance, apy, score) = (excluded.inflation_reward, excluded.inflation_post_balance, excluded.apy, excluded.score)";
             transaction.execute(query, &[])?;
             transaction.commit()?;
 
