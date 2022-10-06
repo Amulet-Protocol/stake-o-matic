@@ -1758,8 +1758,7 @@ fn fetch_store_validators(config: Config, rpc_client: RpcClient, mut db_client: 
 
     info!("Loading participants...");
     let participants = match get_participants_with_state(
-        &RpcClient::new_with_timeout("https://api.mainnet-beta.solana.com".to_string(),
-                                     Duration::from_secs(480)),
+        &rpc_client,
         Some(ParticipantState::Approved),
     ){
         Ok(participants) => participants,
@@ -1789,7 +1788,9 @@ fn fetch_store_validators(config: Config, rpc_client: RpcClient, mut db_client: 
         .unzip();
 
     info!("{} participants loaded", participants.len());
-    assert!(participants.len() > 450); // Hard coded sanity check...
+    if config.cluster == Cluster::MainnetBeta {
+        assert!(participants.len() > 450); // Hard coded sanity check...
+    }
 
     let (validator_list, identity_to_participant) = match config.cluster {
         Cluster::MainnetBeta => (
