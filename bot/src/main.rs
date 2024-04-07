@@ -1909,11 +1909,6 @@ fn fetch_store_validators(config: Config, rpc_client: RpcClient, mut db_client: 
         validator_stake_change_notes.sort();
         notifications.extend(validator_stake_change_notes);
     }
-
-    if first_time {
-        EpochClassification::new(epoch_classification).save(epoch, &config.cluster_db_path())?;
-    }
-
     if post_notifications {
         for notification in notifications {
             info!("notification: {}", notification);
@@ -1922,7 +1917,7 @@ fn fetch_store_validators(config: Config, rpc_client: RpcClient, mut db_client: 
     }
 
     //conditional to: matches.is_present("markdown")
-    generate_markdown(epoch, config, db_client)?;
+    generate_markdown(epoch, config, db_client, epoch_classification)?;
 
     Ok(())
 }
@@ -1945,20 +1940,8 @@ pub fn run(args: &Vec<String>) -> BoxResult<()> {
     fetch_store_validators(config, rpc_client, db_client, optional_stake_pool)
 }
 
-fn generate_markdown(epoch: Epoch, config: Config, mut db_client: postgres::Client) -> BoxResult<()> {
-    let markdown_path = match config.markdown_path.as_ref() {
-        Some(d) => d,
-        None => return Ok(()), // exit if !matches.is_present("markdown")
-    };
-    fs::create_dir_all(&markdown_path)?;
-
-    let list = vec![(
-        epoch,
-        EpochClassification::load(epoch, &config.cluster_db_path())?.into_current(),
-    )];
-
-    for (epoch, epoch_classification) in list.iter() {
-        if let Some(ref validator_classifications) = epoch_classification.validator_classifications
+fn generate_markdown(epoch: Epoch, config: Config, mut db_client: postgres::Client, epoch_classification: EpochClassificationV1) -> BoxResult<()> {
+    if let Some(ref validator_classifications) = epoch_classification.validator_classifications
         {
             let mut validator_detail_csv = vec![];
             validator_detail_csv.push("epoch,keybase_id,name,identity,vote_address,score,average_position,commission,active_stake,epoch_credits,data_center_concentration,can_halt_the_network_group,stake_state,stake_state_reason,www_url,is_delegation_program,inflation_reward,inflation_post_balance,apy,software_version,description".into());
@@ -2045,7 +2028,7 @@ fn generate_markdown(epoch: Epoch, config: Config, mut db_client: postgres::Clie
                     poor_block_producer_percentage, too_many_poor_block_producers, too_many_old_validators,
                     notes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT(epoch) DO NOTHING",
                 &[
-                    &(*epoch as i32),
+                    &(epoch as i32),
                     &(epoch_classification.cluster_state.min_epoch_credits as i32),
                     &(epoch_classification.cluster_state.avg_epoch_credits as i32),
                     &(epoch_classification.cluster_state.poor_voter_percentage as i32),
@@ -2057,8 +2040,6 @@ fn generate_markdown(epoch: Epoch, config: Config, mut db_client: postgres::Clie
                     &epoch_classification.notes.join("\n")],
             )?;
         }
-    }
-
     Ok(())
 }
 
