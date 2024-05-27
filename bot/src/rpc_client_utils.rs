@@ -16,6 +16,7 @@ use {
     },
     serde::{Deserialize, Serialize},
     solana_sdk::{
+        account::Account,
         clock::Epoch,
         native_token::*,
         pubkey::Pubkey,
@@ -353,7 +354,7 @@ pub fn get_inflation_rewards(
     epoch: Epoch
 ) -> Result<HashMap<Pubkey, InflationRewardInfo>, Box<dyn error::Error>>{
     // get all the stake accounts
-    let stake_accounts = get_stake_accounts(rpc_client)?;
+    let stake_accounts = get_stake_accounts(rpc_client, vote_accounts)?;
     info!("Stake accounts len: {}", stake_accounts.len());
     // (vote_account, stake_account)
     let addresses: Vec<(Pubkey, Pubkey)> = vote_accounts.into_iter().flat_map(|vote_account| {
@@ -489,11 +490,37 @@ pub fn get_vote_account_info(
 
 pub fn get_stake_accounts(
     rpc_client: &RpcClient,
+    vote_accounts: &Vec<VoteAccountInfo>,
 ) -> Result<HashMap<Pubkey, Vec<StakeAccountInfo>>, Box<dyn error::Error>> {
     let mut all_stake_addresses = HashMap::<Pubkey, Vec<StakeAccountInfo>>::new();
-    let all_stake_accounts = rpc_client.get_program_accounts(
-        &stake::program::id()
-    )?;
+    let all_stake_accounts = Arc::new(Mutex::new(Vec::new()));
+    vote_accounts.par_iter().for_each(|v| {
+        match rpc_client.get_program_accounts_with_config(
+            &stake::program::id(),
+            RpcProgramAccountsConfig {
+                filters: Some(vec![
+                    rpc_filter::RpcFilterType::Memcmp(rpc_filter::Memcmp {
+                        offset: 124,
+                        bytes: rpc_filter::MemcmpEncodedBytes::Binary(v.vote_address.to_string()),
+                        encoding: Some(rpc_filter::MemcmpEncoding::Binary),
+                    })
+                ]),
+                account_config: RpcAccountInfoConfig {
+                    encoding: Some(solana_account_decoder::UiAccountEncoding::Base64Zstd),
+                    commitment: Some(rpc_client.commitment()),
+                    ..RpcAccountInfoConfig::default()
+                },
+                ..RpcProgramAccountsConfig::default()
+            },
+        ) {
+            Ok(accounts) => {
+                all_stake_accounts.lock().unwrap().extend(accounts);
+            },
+            Err(e)=> {
+                info!("Error fetching stake accounts for vote account {}: {}", v.vote_address.to_string(), e);
+            }
+        };
+    });
     let stake_history_account = rpc_client
         .get_account_with_commitment(&sysvar::stake_history::id(), CommitmentConfig::finalized())?
         .value
@@ -504,7 +531,7 @@ pub fn get_stake_accounts(
     let clock_account = rpc_client.get_account(&sysvar::clock::id())?;
     let clock: Clock = from_account(&clock_account).ok_or("Failed to deserialize clock sysvar")?;
     let current_epoch = clock.epoch;
-    for (stake_pubkey, stake_account) in all_stake_accounts {
+    for (stake_pubkey, stake_account) in all_stake_accounts.lock().unwrap().iter() {
         if let Ok(stake_state) = stake_account.state() {
             match stake_state {
                 StakeState::Stake(_, stake) => {
@@ -512,7 +539,7 @@ pub fn get_stake_accounts(
                         .delegation
                         .stake_activating_and_deactivating(current_epoch, Some(&stake_history));
                     let stake_account_info = StakeAccountInfo {
-                        stake_account: stake_pubkey,
+                        stake_account: stake_pubkey.clone(),
                         voter_pubkey: stake.delegation.voter_pubkey,
                         stake: stake.delegation.stake,
                         activation_epoch: stake.delegation.activation_epoch,

@@ -1,4 +1,5 @@
 use std::time::Instant;
+use rayon::prelude::*;
 use openssl::ssl::{SslConnector, SslMethod};
 use postgres_openssl::MakeTlsConnector;
 use postgres::types::Type;
@@ -1924,7 +1925,7 @@ fn fetch_store_validators(config: Config, rpc_client: RpcClient, mut db_client: 
 
 fn main() -> BoxResult<()> {
     solana_logger::setup_with_default("solana=info");
-
+    rayon::ThreadPoolBuilder::new().num_threads(5).build_global().unwrap();
     let (config, rpc_client, db_client, optional_stake_pool) =
         get_config(std::env::args_os())?;
 
